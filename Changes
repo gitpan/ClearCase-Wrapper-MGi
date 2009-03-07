@@ -30,3 +30,7 @@ Revision history for Perl extension ClearCase::Wrapper::MGi.
 	- lsgen: use of portable quoting pattern
 	- checkcs/co: fix for use of relative path
 	- co: less verbose, and cleaning away the trivial contrib files
+
+0.08 Sat Mar  7 10:58:19 GMTST 2009
+	- co: the internal mkbranch defaults to -nc
+	- lsgen: extracted the parsing of the version tree
