@@ -4,4 +4,7 @@ Makefile.PL
 MANIFEST
 README
 test.pl
+extra/.clearcase_profile.pl
+extra/locklbtype
+extra/locklbtype.pod
 META.yml                                 Module meta-data (added by MakeMaker)

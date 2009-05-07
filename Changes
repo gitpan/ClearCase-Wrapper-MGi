@@ -43,3 +43,9 @@ Revision history for Perl extension ClearCase::Wrapper::MGi.
 	- lsgen/diff: fix when selected branch/0
 	- mkbranch
 	- unco, with rmbranch if leaving only branch/0
+
+0.10 Sat Apr 25 18:37:47 GMTDT 2009
+	- co: fixed typo--restored standard flags support
+	- mklbtype -fam and -inc, including -rep
+	- lock, and silent locking from within mklbtype -inc
+	- added the extra directory, with scripts to enable group locking
