@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.10';
+$VERSION = '0.11';
 
 use warnings;
 use strict;
@@ -31,6 +31,7 @@ use ClearCase::Wrapper;
   $lsgenealogy =
     "$z [-short] [-all] [-obsolete] [-depth gen-depth] pname ...";
   $mklbtype = "\n* [-family] [-increment] [-archive] pname ...";
+  $mklabel	= "\n* [-up] [-force] [-over type]";
 }
 
 #############################################################################
@@ -202,7 +203,7 @@ sub mkbco($$$$$$) {
   my $typ = $ct->argv(qw(des -fmt %m), $e)->qx;
   if ($typ !~ /(branch|version)$/) {
     warn Msg('W', "Not a vob object: $e");
-    return;
+    return 1;
   }
   my $ver;
   if ($e =~ m%^(.*?)\@\@.*$%) {
@@ -243,8 +244,9 @@ sub mkbco($$$$$$) {
       }
     }
   } else {
-    push @$gopt, @$bopt, @$copt, $e; # Ensure non empty array
-    return $ct->argv('co', @$gopt)->system;
+    my @args;
+    push @args, @$gopt, @$bopt, @$copt, $e; # Ensure non empty array
+    return $ct->argv('co', @args)->system;
   }
 }
 sub ensuretypes(@) {
@@ -302,13 +304,106 @@ sub findnext($) {		# on input, the type exists
   }
 }
 sub findfreeinc($) {	   # on input, the values may or may not exist
-  my $nxt = shift;
+  my ($nxt, %n) = shift;
   while (my ($k, $v) = each %{$nxt}) {
-    if ($ct->argv(qw(des -s), "lbtype:$v")->stderr(0)->qx) { #exists
+    while ($ct->argv(qw(des -s), "lbtype:$v")->stderr(0)->qx) { #exists
       my @cand = sort compareincs findnext($v);
-      $$nxt{$k} = nextinc($cand[$#cand]);
+      $v = nextinc($cand[$#cand]);
+    }
+    $n{$k} = $v;
+  }
+  while (my ($k, $v) = each %n) { $$nxt{$k} = $v }
+}
+sub preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
+  my ($cmd, $fn) = @_; #already parsed, 3 groups: cquery|cqeach nc c|cfile=s
+  use warnings;
+  use strict;
+  my @opts = $cmd->opts;
+  my ($ret, @mod, @copt) = 0;
+  my ($cqf, $ncf, $cf) =
+    ($cmd->flag('cquery'), $cmd->flag('nc'), $cmd->flag('c'));
+  if (!$cqf and !$ncf and !$cf) {
+    if (defined $ENV{_CLEARCASE_PROFILE}) { #ClearCase::Argv shift
+      if (open PRF, "<$ENV{_CLEARCASE_PROFILE}") {
+	while (<PRF>) {
+	  if (/^\s*(.*?)\s+(-\w+)/) {
+	    my ($op, $fg) = ($1, $2);
+	    if (($op eq ($cmd->prog())[1]) or ($op eq '*')) {
+	      if ($fg eq '-nc') {
+		$ncf = 1;
+	      } elsif ($fg eq '-cqe') {
+		$cqf = 1;
+		push @opts, '-cqe';
+	      } elsif ($fg eq '-cq') {
+		$cqf = 1;
+		push @opts, '-cq';
+	      }
+	      last;
+	    }
+	  }
+	}
+	close PRF;
+      }
+    }
+    if (!$cqf and !$ncf and !$cf) {
+      if (($cmd->prog())[1] =~
+	    /^(check(in|out)|mk(dir|elem|(at|br|el|hl|lb|tr)type|pool|vob))$/) {
+	$cqf = 1;
+	push @opts, '-cqe';
+      } else {
+	$ncf = 1;
+      }
     }
   }
+  if ($ncf or $cf) {
+    if ($ncf) {
+      $cmd->opts(grep !/^-nc/,@opts);
+      $ret = &$fn($cmd, qw(-nc));
+    } else {
+      my $skip = 0;
+      for (@opts) {
+	if ($skip) {
+	  $skip = 0;
+	  push @copt, $_;
+	} else {
+	  if (/^-c/) {
+	    $skip = 1;
+	    push @copt, $_;
+	  } else {
+	    push @mod, $_;
+	  }
+	}
+      }
+      $cmd->opts(@mod);
+      $ret = &$fn($cmd, @copt);
+    }
+  }
+  if ($cqf) {
+    my $cqe = grep /^-cqe/, @opts;
+    $cmd->opts(grep !/^-cq/, @opts);
+    my @arg = $cmd->args;
+    my $go = 1;
+    while ($go) {
+      if ($cqe) {
+	my $arg = shift @arg;
+	$cmd->args($arg);
+	$go = scalar @arg;
+	print qq(Comments for "$arg":\n);
+      } else {
+	$go = 0;
+	print "Comment for all listed objects:\n";
+      }
+      my $cmt = '';
+      while (<STDIN>) {
+	last if /^\.$/;
+	$cmt .= $_;
+      }
+      chomp $cmt;
+      $cmt =~ s/\r?\n/\\n/mg;
+      $ret |= &$fn($cmd, '-c', $cmt);
+    }
+  }
+  exit $ret;
 }
 
 =head1 NAME
@@ -323,7 +418,7 @@ David Boyce) for more details.
 
 =head1 CLEARTOOL EXTENSIONS
 
-=over 8
+=over 9
 
 =item * LSGENEALOGY
 
@@ -448,7 +543,7 @@ sub checkout {
   return 0 if grep /^-bra/, @ARGV[1..$#ARGV];
   my %opt;
   GetOptions(\%opt, qw(reserved unreserved nmaster out=s ndata ptime
-		       nwarn c=s cfile=s cq cqe nc version branch=s
+		       nwarn c=s cfile=s cquery cqeach nc version branch=s
 		       query nquery usehijack));
   if (my @o = grep /^-/, @ARGV) {
     if (!(grep /^--$/, @o)) {
@@ -467,8 +562,8 @@ sub checkout {
   push @gopts, q(-pti) if $opt{ptime};
   push @gopts, q(-nwa) if $opt{nwarn};
   push @gopts, q(-cfi), $opt{cfile}   if $opt{cfile};
-  push @gopts, q(-cq)  if $opt{cq};
-  push @gopts, q(-cqe) if $opt{cqe};
+  push @gopts, q(-cq)  if $opt{cquery};
+  push @gopts, q(-cqe) if $opt{cqeach};
   push @gopts, q(-que) if $opt{query};
   push @gopts, q(-nqu) if $opt{nquery};
   push @gopts, q(-use) if $opt{usehijack};
@@ -527,7 +622,7 @@ sub mkbranch {
   }
   return 0 if grep /^-nco/, @ARGV[1..$#ARGV];
   my %opt;
-  GetOptions(\%opt, qw(c=s cfile=s cq cqe nc nwarn version));
+  GetOptions(\%opt, qw(c|cfile=s cquery|cqeach nc nwarn version));
   if (my @o = grep /^-/, @ARGV) {
     if (!(grep /^--$/, @o)) {
       warn Msg('E', "Unsupported options: @o");
@@ -538,8 +633,8 @@ sub mkbranch {
   push @bopts, q(-ver) if $opt{version};
   my @gopts = ();
   push @gopts, q(cfile), $opt{cfile} if $opt{cfile};
-  push @gopts, q(cq)    if $opt{cq};
-  push @gopts, q(cqe)   if $opt{cqe};
+  push @gopts, q(cq)    if $opt{cquery};
+  push @gopts, q(cqe)   if $opt{cqeach};
   push @gopts, q(nwarm) if $opt{nwarm};
   my @copt = ();
   push @copt, q(-c), $opt{c} if $opt{c};
@@ -555,6 +650,8 @@ sub mkbranch {
   my $rc = 0;
   my %pbrt = ();
   my $bt = shift @args;
+  $bt =~ s/^brtype:(.*)$/$1/;
+  die if $ct->argv(qw(des -s), "brtype:$bt")->stdout(0)->system;
   foreach my $e (@args) {
     $rc |= mkbco($e, $bt, \%pbrt, \@bopts, \@gotps, \@copt);
   }
@@ -629,7 +726,7 @@ sub uncheckout {
   my $unco = ClearCase::Argv->new(@ARGV);
   $unco->parse(qw(keep rm cact cwork));
   $unco->optset('IGNORE');
-  $unco->parseIGNORE(qw(c|cfile=s cqe|nc));
+  $unco->parseIGNORE(qw(c|cfile=s cquery|cqeach nc));
   $unco->args(sort {$b cmp $a} AutoCheckedOut($opt{ok}, $unco->args));
   $ct = ClearCase::Argv->new({autochomp=>1});
   my @b0 = grep { m%[\\/]CHECKEDOUT$% }
@@ -699,7 +796,7 @@ destination of the B<EqInc> hyperlink on the I<family> type.
 It will have a B<PrevInc> hyperlink pointing to the previous increment in
 the family.
 
-=item B<arc/hive>
+=item B<-arc/hive>
 
 Rename the current type to an I<archive> value (name as prefix, and a
 numeral suffix. Initial value: I<-001>), create a new type, and make the
@@ -714,22 +811,23 @@ property.
 
 =cut
 
-sub mklbtype {
-  my (%opt, $rep);
-  GetOptions(\%opt, qw(family increment archive));
+sub _foo($@) {
+  my ($foo, @cmt) = @_;
+  print "foo ", join(' ', @cmt, $foo->opts, $foo->args), "\n";
+  return 0;
+}
+sub foo {
+  my $foo = ClearCase::Argv->new(@ARGV);
+  $foo->parse(qw(cquery|cqeach nc c|cfile=s));
+  my @cmt = preemptcmt($foo, \&_foo);
+}
+sub _mklbtype {
+  my ($ntype, @cmt) = @_;
+  my $rep;
   GetOptions('replace' => \$rep);
-  return if !%opt and grep /^-(ord|glo)/, @ARGV;
-  die Msg('E', 'Incompatible options: family increment archive')
-    if keys %opt > 1;
-  die Msg('E', 'Incompatible options: incremental types cannot be global')
-    if %opt and grep /^-glo/, @ARGV;
-  ClearCase::Argv->ipc(1);
   $ct = ClearCase::Argv->new({autochomp=>1});
-  my $ntype = ClearCase::Argv->new(@ARGV);
-  $ntype->parse(qw(global|ordinary vpelement|vpbranch|vpversion
-		pbranch|shared gt|ge|lt|le|enum|default|vtype=s cqe|nc
-		c|cfile=s));
   my @args = $ntype->args;
+  my %opt = %{$ntype->{fopts}};
   my $silent = $ct->clone;
   $silent->stdout(0);
   if (!%opt and my ($ahl) = grep /^->/,
@@ -741,20 +839,27 @@ sub mklbtype {
 	warn Msg('W', "making global type $_ ...");
       }
       $ntype->args(@args);
-      my @opts = ('-global', $ntype->opts);
+      my @opts = (@cmt, '-global', $ntype->opts);
       push @opts, '-replace' if $rep;
       $ntype->opts(@opts);
-      $ntype->exec;
+      return $ntype->system;
     }
   } elsif (%opt) {
     map { s/^lbtype:(.*)$/$1/ } @args;
+    my @a = @args;
+    my @vob = grep { s/.*\@(.*)$/$1/ } @a;
+    push @vob, $ct->argv(qw(des -s vob:.))->stderr(0)->qx
+      if grep !/@/, @args;
+    die  Msg('E', qq(Unable to determine VOB for pathname ".".\n))
+      unless @vob;
+    ensuretypes(@vob);
     if ($rep) {
-      @args = grep { $_ = $ct->argv(qw(des -s), "lbtype:$_")->qx } @args;
+      @args = grep { $ct->argv(qw(des -fmt), '%Xn', "lbtype:$_")->qx } @args;
       exit 1 unless @args;
       if ($opt{family}) {
-	my @a = ();
+	@a = ();
 	foreach my $t (@args) {
-	  if ($ct->argv(qw(des -s -ahl), $eqhl, "lbtype:$t")->stderr(0)->qx) {
+	  if ($ct->argv(qw(des -s -ahl), $eqhl, $t)->stderr(0)->qx) {
 	    warn Msg('E', "$t is already a family type\n");
 	  } else {
 	    push @a, $t;
@@ -763,12 +868,13 @@ sub mklbtype {
 	exit 1 unless @a;
 	my %pair = ();
 	foreach (@a) {
-	  if (/^(.*)(@@.*)?$/) {
-	    $pair{$_} = "${1}_1.00" . ($2? $2:'');
+	  if (/^lbtype:(.*)(@.*)$/) {
+	    $pair{"$1$2"} = "${1}_1.00$2";
 	  }
 	}
 	findfreeinc(\%pair);
 	$ntype->args(values %pair);
+	$ntype->opts(@cmt, $ntype->opts);
 	$ntype->system;
 	map {
 	  if (defined($pair{$_})) {
@@ -780,23 +886,23 @@ sub mklbtype {
 	die Msg('E', "Incompatible flags: replace and incremental");
       }
     } else {
-      my @a = @args;
-      my @vobs = grep { s/.*\@(.*)$/$1/ } @a;
-      push @vob, $ct->argv(qw(des -s vob:.))->stderr(0)->qx
-	if grep !/@/, @args;
-      die  Msg('E', qq(Unable to determine VOB for pathname ".".\n))
-	unless @vob;
-      ensuretypes(@vob);
-      @a = @args;
       if ($opt{family}) {
+	map { $_ = "lbtype:$_" } @a;
+	die Msg('E', "Some types already exist among @args")
+	  unless $silent->argv(qw(des -s), @a)->stderr(0)->system;
 	my %pair = ();
-	foreach (@a) {
-	  if (/^(.*)(@@.*)?$/) {
+	foreach (@args) {
+	  if (/^(.*?)(@.*)?$/) {
 	    $pair{$_} = "${1}_1.00" . ($2? $2:'');
 	  }
 	}
 	findfreeinc(\%pair);
-	$ntype->args(@args, values %pair);
+	my @opts = $ntype->opts();
+	$ntype->args(values %pair);
+	$ntype->opts(@cmt, @opts);
+	$ntype->system;
+	$ntype->args(@args);
+	$ntype->opts('-nc', @opts);
 	$ntype->system;
 	map {
 	  if (defined($pair{$_})) {
@@ -804,9 +910,12 @@ sub mklbtype {
 	    $silent->argv('mkhlink', $eqhl, "lbtype:$_", $inc)->system;
 	  }
 	} keys %pair;
-      } elsif($opt{increment}) {			# increment
+      } elsif ($opt{increment}) { # increment
 	for my $t (@args) {
-	  $ct->argv(qw(des -s), "lbtype:$t")->stdout(0)->system;
+	  die
+	    Msg('E',
+		"Lock on label type \"$t\" prevents operation \"make lbtype\"")
+	      if $ct->argv(qw(lslock -s),"lbtype:$t")->stderr(0)->qx;
 	  my ($pair) = grep s/^\s*(.*) -> lbtype:(.*)\@(.*)$/$1,$2,$3/,
 	    $ct->argv(qw(des -l -ahl), $eqhl, "lbtype:$t")->stderr(0)->qx;
 	  my ($hlk, $prev, $vob) = split ',', $pair if $pair;
@@ -815,7 +924,8 @@ sub mklbtype {
 	    my ($base, $maj, $min) = ($1, $2, $3);
 	    my $new = "${base}_" .
 	      (defined($min)? $maj . '.' . ++$min : ++$maj);
-	    $new .= $1 if $t =~ /^.*(@.*)$/;
+	    map { $_ .= $1 } ($new, $prev) if $t =~ /^.*(@.*)$/;
+	    $ntype->opts(@cmt, $ntype->opts);
 	    $ntype->args($new)->system;
 	    $silent->argv('rmhlink', $hlk)->system;
 	    $silent->argv(qw(mkhlink -nc), $eqhl,
@@ -834,7 +944,7 @@ sub mklbtype {
     exit 0;
   } else {			# non inc
     if ($rep) {
-      $ntype->opts('-replace', $ntype->opts);
+      $ntype->opts(@cmt, '-replace', $ntype->opts);
       map { $_ = "lbtype:$_" unless /^lbtype:/ } @args;
       my @a = $ct->argv(qw(des -s), @args)->stderr(0)->qx;
       if (@a) {
@@ -843,8 +953,27 @@ sub mklbtype {
 	  $ct->argv(qw(des -l -ahl), "$eqhl,$prhl", @a)->qx;
 	$ct->argv('rmhlink', @link)->system;
       }
+    } else {
+      $ntype->opts(@cmt, $ntype->opts);
+      return $ntype->system;
     }
   }
+}
+sub mklbtype {
+  my %opt;
+  GetOptions(\%opt, qw(family increment archive));
+  return if !%opt and grep /^-(ord|glo)/, @ARGV;
+  die Msg('E', 'Incompatible options: family increment archive')
+    if keys %opt > 1;
+  die Msg('E', 'Incompatible options: incremental types cannot be global')
+    if %opt and grep /^-glo/, @ARGV;
+  ClearCase::Argv->ipc(1);
+  my $ntype = ClearCase::Argv->new(@ARGV);
+  $ntype->parse(qw(global|ordinary vpelement|vpbranch|vpversion
+		   pbranch|shared gt|ge|lt|le|enum|default|vtype=s
+		   cquery|cqeach nc c|cfile=s));
+  $ntype->{fopts} = \%opt;
+  preemptcmt($ntype, \&_mklbtype);
 }
 
 =item * LOCK
@@ -860,6 +989,17 @@ existing locks.
 
 In case of a family type, lock also the equivalent incremental type.
 
+There may be an issue if the two types are not owned by the same account.
+You may overcome it by providing a module specification via the environment
+variable B<FORCELOCK>. This module must export both a B<flocklt> and a
+B<funlocklt> (force lock and unlock label type) functions.
+The functions take an B<lbtype> and a B<vob tag> as input (B<flocklt>
+optionally takes a B<replace> flag and an B<nusers> exception list).
+The two functions take the responsibility of printing the standard output
+(but not necessarily the errors), and return an error code: 0 for success,
+other for error.
+See the documentation for examples of implementation.
+
 =cut
 
 sub lock {
@@ -868,7 +1008,7 @@ sub lock {
   GetOptions('nusers=s' => \$nusers);
   ClearCase::Argv->ipc(1);
   my $lock = ClearCase::Argv->new(@ARGV);
-  $lock->parse(qw(c|cfile=s cquery|cqeach pname=s obsolete replace));
+  $lock->parse(qw(c|cfile=s cquery|cqeach nc pname=s obsolete replace));
   die Msg('E', "cannot specify -nusers along with -allow or -deny")
     if %opt and $nusers;
   die Msg('E', "cannot use -allow or -deny with multiple objects")
@@ -891,7 +1031,8 @@ sub lock {
     }
     $lock->opts($lock->opts, '-nusers', join(',', sort keys %nusers))
       if %nusers;
-  } elsif (($nusers or $opt{allow}) and (!$currlock or $opt{iflocked})) {
+  } elsif (($nusers or $opt{allow}) and
+	     (!$currlock or $opt{iflocked}) or $lock->flag('replace')) {
     $lock->opts($lock->opts, '-nusers', ($nusers or $opt{allow}));
   }
   $lock->opts($lock->opts, '-replace')
@@ -931,11 +1072,22 @@ sub lock {
     }
   }
   my $rc = @oth? $lock->args(@oth)->system : 0;
+  my ($fl, $loaded) = $ENV{FORCELOCK};
   for my $lt (@lbt) {
     my $v = $vob{$lt};
-    $rc |= $lock->args("lbtype:$lt\@$v")->stderr(0)->system
-      and (defined(&flocklt) and flocklt($lt, $v, ($nusers or $opt{allow})))
-      and warn Msg('E', "Could not lock lbtype:$lt\@$v");
+    if ($lock->args("lbtype:$lt\@$v")->stderr(0)->system) {
+      if ($fl and !$loaded) {
+	my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
+	require $fn;
+	$fl->import;
+	$loaded = 1;
+      }
+      if (!$fl or flocklt($lt, $v, $lock->flag('replace'),
+			  ($nusers or $opt{allow}))) {
+	warn Msg('E', "Could not lock lbtype:$lt\@$v");
+	$rc = 1;
+      }
+    }
   }
   exit $rc;
 }
@@ -944,12 +1096,16 @@ sub lock {
 
 In case of a family type, unlock also the equivalent incremental type.
 
+There may be an issue if the two types are not owned by the same account.
+See the B<LOCK> documentation for overcoming it with a B<FORCELOCK>
+environment variable.
+
 =cut
 
 sub unlock() {
   ClearCase::Argv->ipc(1);
   my $unlock = ClearCase::Argv->new(@ARGV);
-  $unlock->parse(qw(c|cfile=s cquery|cqeach|nc version=s pname=s));
+  $unlock->parse(qw(c|cfile=s cquery|cqeach nc version=s pname=s));
   my @args = $unlock->args;
   $ct = ClearCase::Argv->new({autochomp=>1});
   my (@lbt, @oth, %vob);
@@ -974,12 +1130,22 @@ sub unlock() {
     }
   }
   my $rc = @oth? $unlock->args(@oth)->system : 0;
+  my ($fl, $loaded) = $ENV{FORCELOCK};
   for my $lt (@lbt) {
     my $v = $vob{$lt};
     if ($ct->argv(qw(lslock -s), "lbtype:$lt\@$v")->qx) {
-      $rc |= $unlock->args("lbtype:$lt\@$v")->stderr(0)->system
-	and (defined(&funlocklt) and funlocklt($lt, $v))
-	and die Msg('E', "Could not unlock lbtype:$lt\@$v");
+      if ($unlock->args("lbtype:$lt\@$v")->stderr(0)->system) {
+	if ($fl and !$loaded) {
+	  my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
+	  require $fn;
+	  $fl->import;
+	  $loaded = 1;
+	}
+	if (!$fl or funlocklt($lt, $v)) {
+	  warn Msg('E', "Could not unlock lbtype:$lt\@$v");
+	  $rc = 1;
+	}
+      }
     } else {
       warn Msg('E', 'Object is not locked.');
       warn Msg('E', "Unable to unlock label type \"$lt\".");
@@ -987,6 +1153,142 @@ sub unlock() {
     }
   }
   exit $rc;
+}
+
+=item * MKLABEL
+
+In case of a family type, apply also the equivalent incremental type.
+The meaning of B<-replace> is affected: it concerns the equivalent fixed
+type, and is implicit for the floating type (the one given as argument).
+
+Preserve the support for the B<-up> flag from B<ClearCase::Wrapper::DSB>
+and lift the restriction to using it only with B<-recurse>.
+
+Added a B<-force> option which makes mostly sense in the case of applying
+incremental labels. Without it, applying the floating label type will be
+skipped if there has been errors while (incrementally) applying the
+equivalent fixed one. Forcing the application may make sense if the errors
+come from multiple application e.g. due to links, or in order to retry the
+application after a first failure.
+It may also be used to apply labels upwards even if recursive application
+produced errors.
+
+Extension: B<-over> takes either a label or a branch type. In either case,
+the labels will be applied over the result of a find command run on the
+unique version argument, and looking for versions matching respectively
+B<lbtype(xxx)> or <version(.../xxx/LATEST)> queries, and B<!lbtype(lb)> (with
+I<xxx> the B<-over>, and I<lb> the main label type parameter.
+
+=cut
+
+sub mklabel {
+  use warnings;
+  use strict;
+  my %opt;
+  GetOptions(\%opt, qw(up force over=s));
+  ClearCase::Argv->ipc(1);
+  my $mkl = ClearCase::Argv->new(@ARGV);
+  $mkl->parse(qw(replace|recurse|ci|cq|nc
+		 version|c|cfile|select|type|name|config=s));
+  my @opt = $mkl->opts();
+  die Msg('E', 'Incompatible flags: up and config')
+    if $opt{up} and grep /^-con/, @opt;
+  die Msg('E', 'Incompatible flags: recurse and over')
+    if $opt{over} and grep /^-r(ec|$)/, @opt;
+  die Msg('E', 'Incompatible flags: up and over') if $opt{up} and $opt{over};
+  my($lbtype, @elems) = $mkl->args;
+  die Msg('E', "Only one version argument with the over flag: ")
+    if $opt{over} and scalar @elems > 1;
+  $lbtype =~ s/^lbtype://;
+  $ct = ClearCase::Argv->new({autochomp=>1});
+  my $fail = $ct->clone({autofail=>1});
+  $fail->argv(qw(des -s), @elems)->stdout(0)->system;
+  my @et = grep s/^-> lbtype:(.*)@.*$/$1/,
+    $ct->argv(qw(des -s -ahl), $eqhl, "lbtype:$lbtype")->qx;
+  return 0 unless $opt{up} or $opt{over} or @et;
+  die Msg('E',
+	  "Lock on label type \"$lbtype\" prevents operation \"make label\"")
+    if $ct->argv(qw(lslock -s),"lbtype:$lbtype")->stderr(0)->qx;
+  my ($ret, @rec, @mod) = 0;
+  if (grep /^-r(ec|$)/, @opt) {
+    if (@et) {
+      @rec = $ct->argv(qw(ls -s -r -vob), @elems)->qx;
+    } else {
+      $mkl->syfail(1) unless $opt{force};
+      $ret = $mkl->system;
+    }
+  } elsif ($opt{over}) {
+    my ($t, $ver, $lb) = ($opt{over}, $elems[0]);
+    die Msg('E', 'The -over flag requires a local type argument')
+      if !$t or $t =~ /\@/;
+    my $vob = $fail->argv(qw(des -s), "vob:$ver")->qx;
+    if ($t =~ /lbtype:(.*)$/) {
+      $t = $1; $lb = 1;
+      die unless $ct->argv(qw(des -s), "lbtype:$t\@$vob")->qx;
+    } elsif ($t =~ /brtype:(.*)/) {
+      $t = $1; $lb = 0;
+      die unless $ct->argv(qw(des -s), "brtype:$t\@$vob")->qx;
+    } else {
+      if ($ct->argv(qw(des -s), "lbtype:$t\@$vob")->stderr(0)->qx) {
+	$lb = 1;
+      } elsif ($ct->argv(qw(des -s), "brtype:$t\@$vob")->stderr(0)->qx) {
+	$lb = 0;
+      } else {
+	die Msg('E', 'The argument of the -over flag must be an existing type')
+      }
+    }
+    my $query = $lb? "lbtype($t)" : "version(.../$t/LATEST)";
+    $query .= " \&\&! lbtype($lbtype)";
+    @mod = $ct->argv('find', $ver, '-ver', $query, '-print')->stderr(0)->qx;
+  }
+  $mkl->opts(grep !/^-r(ec|$)/, @opt); # recurse handled already
+  @opt = $mkl->opts;
+  if ($opt{up}) {
+    my $dsc = ClearCase::Argv->new({-autochomp=>1});
+    require File::Basename;
+    require File::Spec;
+    File::Spec->VERSION(0.82);
+    my $vroot;
+    if ($^O eq 'cygwin') {
+      $vroot = '/cygdrive/a'; #just for the length
+    } elsif ($^O =~ /MSWin/) {
+      $vroot = 'a:';
+    } else {
+       $vroot = $ct->argv(qw(pwv -root))->qx;
+    }
+    my %ancestors;
+    for my $pname (@elems) {
+      my $vobtag = $dsc->desc(['-s'], "vob:$pname")->qx;
+      my $stop = length("$vroot$vobtag");
+      for (my $dad = File::Basename::dirname(File::Spec->rel2abs($pname));
+	   length($dad) >= $stop;
+	   $dad = File::Basename::dirname($dad)) {
+	$ancestors{$dad}++;
+      }
+    }
+    if (@et) {
+      push @elems, sort {$b cmp $a} keys %ancestors;
+    } else {
+      $ret |= $mkl->args($lbtype, @elems)->system;
+      exit $ret;
+    }
+  }
+  # Necessarily in the incremental type case
+  if (!$opt{over}) {
+    push @elems, @rec;
+    @mod = grep {
+      my $v = $_;
+      $_ = (grep /^$lbtype$/, split/ /,
+	    $ct->argv(qw(des -fmt), '%Nl', $v)->qx)? '' : $v;
+    } @elems;
+  }
+  exit $ret unless @mod;
+  $ret = $mkl->args($et[0], @mod)->system if @et;
+  exit $ret if $ret and !$opt{force};
+  push @opt, '-rep' unless grep /^-rep/, @opt;
+  $mkl->opts(@opt);
+  $ret |= $mkl->args($lbtype, @mod)->system;
+  exit $ret;
 }
 
 =back

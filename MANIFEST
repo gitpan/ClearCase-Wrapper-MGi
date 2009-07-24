@@ -5,6 +5,11 @@ MANIFEST
 README
 test.pl
 extra/.clearcase_profile.pl
+extra/ForceLock.pm
+extra/ForceLockUnix.pm
+extra/README
+extra/VobPathConv.pm
+extra/VobPathConv.pod
 extra/locklbtype
 extra/locklbtype.pod
 META.yml                                 Module meta-data (added by MakeMaker)

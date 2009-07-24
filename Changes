@@ -47,5 +47,16 @@ Revision history for Perl extension ClearCase::Wrapper::MGi.
 0.10 Sat Apr 25 18:37:47 GMTDT 2009
 	- co: fixed typo--restored standard flags support
 	- mklbtype -fam and -inc, including -rep
-	- lock, and silent locking from within mklbtype -inc
+	- lock, and unlock, forcing if necessary
 	- added the extra directory, with scripts to enable group locking
+
+0.11 Sun Jul 19 10:22:41 GMTDT 2009
+	- added replace option to lock lbtype:
+	- preliminary handling to force locking from Windows/cygwin
+	- mklabel: incremental by default, and for -rec and -up 
+	- mkbranch: error when no brtype
+	- mklabel and mklbtype -inc: check lock on lbtype
+	- mklabel -over
+	- mklbtype: fixes for remote and existing types
+	- mkbco: fix for multiple arguments
+	- mklbtype: comments processed, and distributed to fixed or floating
