@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.12';
+$VERSION = '0.13';
 
 use warnings;
 use strict;
@@ -30,13 +30,15 @@ use AutoLoader 'AUTOLOAD';
   $lsgenealogy =
     "$z [-short] [-all] [-obsolete] [-depth gen-depth] pname ...";
   $mklbtype = "\n* [-family] [-increment] [-archive] pname ...";
-  $mklabel	= "\n* [-up] [-force] [-over type]";
+  $mklabel = "\n* [-up] [-force] [-over type [-all]]";
+  $checkin = "\n* [-dir|-rec|-all|-avobs] [-ok] [-diff [diff-opts]] [-revert]";
 }
 
 #############################################################################
 # Command Aliases
 #############################################################################
 *co             = *checkout;
+*ci		= *checkin;
 *lsgen		= *lsgenealogy;
 *unco           = *uncheckout;
 
@@ -339,9 +341,42 @@ sub _Findfreeinc($) {	   # on input, the values may or may not exist
   }
   while (my ($k, $v) = each %n) { $$nxt{$k} = $v }
 }
+sub _PreCi {
+  use strict;
+  use warnings;
+  my ($ci, @arg) = @_;
+  my $lsco = ClearCase::Argv->lsco([qw(-cview -s)])->stderr(1);
+  if (!$lsco->args(@arg)->qx) {
+    warn Msg('E', 'Unable to find checked out version for '
+	       . join(', ', @arg) . "\n");
+    return 0;
+  }
+  my $opt = $ci->{opthashre};
+  return 1 unless $opt->{diff} || $opt->{revert};
+  my $elem = $arg[0]; #Only one because of -cqe
+  # Make sure the -pred flag is there as we're going one at a time.
+  my $diff = $ci->clone->prog('diff');
+  $diff->optsDIFF(qw(-pred -serial), $diff->optsDIFF);
+  # Without -diff we only care about return code
+  $diff->stdout(0) unless $opt->{diff};
+  # With -revert, suppress msgs from typemgrs that don't do diffs
+  $diff->stderr(0) if $opt->{revert};
+  if ($diff->args($elem)->system('DIFF')) {
+    return 1;
+  } else {
+    if ($opt->{revert}) { # unco instead of checkin
+      _Unco(ClearCase::Argv->unco(['-rm'], $elem));
+      return 0;
+    } else { # -diff
+      warn Msg('E', q(By default, won't create version with )
+		 . q(data identical to predecessor.));
+      return 0;
+    }
+  }
+}
 sub _Preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
   use File::Temp qw(tempfile);
-  my ($cmd, $fn) = @_; #already parsed, 3 groups: cquery|cqeach nc c|cfile=s
+  my ($cmd, $fn, $tst) = @_; #parsed, 3 groups: cquery|cqeach nc c|cfile=s
   use warnings;
   use strict;
   my @opts = $cmd->opts;
@@ -412,11 +447,13 @@ sub _Preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
     while ($go) {
       if ($cqe) {
 	my $arg = shift @arg;
-	$cmd->args($arg);
 	$go = scalar @arg;
+	next if $tst and !&$tst($cmd, $arg);
+	$cmd->args($arg);
 	print qq(Comments for "$arg":\n);
       } else {
 	$go = 0;
+	last if $tst and !&$tst($cmd, @arg); #None checked out
 	print "Comment for all listed objects:\n";
       }
       my $cmt = '';
@@ -463,10 +500,12 @@ sub _Yesno {
   my $ret = 0;
   my @opts = $cmd->opts;
   for my $arg ($cmd->args) {
-    my $res = $test->args($arg)->qx;
-    if (!$res or $res =~ /^cleartool: Error:/) {
-      warn ($res or Msg('E', $errmsg . $arg . "\n"));
-      next;
+    if ($test) {
+      my $res = $test->args($arg)->qx;
+      if (!$res or $res =~ /^cleartool: Error:/) {
+	warn ($res or Msg('E', $errmsg . $arg . "\n"));
+	next;
+      }
     }
     printf $yn->{format}, $arg;
     my $ans = <STDIN>; chomp $ans; $ans = lc($ans);
@@ -479,10 +518,34 @@ sub _Yesno {
     push @opts, $yn->{opt}->{$ans};
     $cmd->opts(@opts);
     $cmd->args($arg);
-    $ret |= &$fn($cmd);
+    $ret |= &{$fn}($cmd);
   }
   exit $ret;
 }
+sub _Checkin {
+  use strict;
+  use warnings;
+  my ($ci, @cmt) = @_;
+  $ci->opts($ci->opts, @cmt);
+  if ($ci->flag('from') and !$ci->flag('keep')) {
+    my %kr = (yes => '-keep', no => '-rm');
+    my %yn = (
+      format   => q(Save private copy of "%s"?  [yes] ),
+      default  => q(yes),
+      valid    => qr/yes|no/,
+      instruct => "Please answer with one of the following: yes, no\n",
+      opt      => \%kr,
+    );
+    my $lsco = ClearCase::Argv->lsco([qw(-cview -s)]);
+    $lsco->stderr(1);
+    my $err = 'Unable to find checked out version for ';
+    my $run = sub { my $ci = shift; $ci->system };
+    _Yesno($ci, $run, \%yn, $lsco, $err); #only one arg: may exit
+  } else {
+    return $ci->system;
+  }
+}
+
 =head1 NAME
 
 ClearCase::Wrapper::MGi - Marc Girod's contributed cleartool wrapper functions
@@ -495,7 +558,7 @@ David Boyce) for more details.
 
 =head1 CLEARTOOL EXTENSIONS
 
-=over 9
+=over 10
 
 =item * LSGENEALOGY
 
@@ -745,7 +808,7 @@ sub uncheckout {
   $unco->parseIGNORE(qw(c|cfile=s cquery|cqeach nc));
   $unco->args(sort {$b cmp $a} AutoCheckedOut($opt{ok}, $unco->args));
   if ($unco->flag('keep')) {
-    _Unco($unco);
+    exit _Unco($unco);
   } else {
     my %kr = (yes => '-keep', no => '-rm');
     my %yn = (
@@ -831,8 +894,7 @@ property.
 
 sub _Mklbtype {
   my ($ntype, @cmt) = @_;
-  my $rep;
-  GetOptions('replace' => \$rep);
+  my $rep = $ntype->{rep};
   $ct = ClearCase::Argv->new({autochomp=>1});
   my @args = $ntype->args;
   my %opt = %{$ntype->{fopts}};
@@ -920,12 +982,17 @@ sub _Mklbtype {
 	} keys %pair;
       } elsif ($opt{increment}) { # increment
 	for my $t (@args) {
-	  die
-	    Msg('E',
-		"Lock on label type \"$t\" prevents operation \"make lbtype\"")
-	      if $ct->argv(qw(lslock -s),"lbtype:$t")->stderr(0)->qx;
+	  my $pt = "lbtype:$t";
+	  if (!$ct->argv(qw(des -s), $pt)->stderr(0)->qx) {
+	    warn Msg('E', qq(Label type not found: "$t"));
+	    next;
+	  } elsif ($ct->argv(qw(lslock -s), $pt)->stderr(0)->qx) {
+	    warn Msg('E', qq(Lock on label type "$t" )
+		       . qq(prevents operation "make lbtype"));
+	    next;
+	  }
 	  my ($pair) = grep s/^\s*(.*) -> lbtype:(.*)\@(.*)$/$1,$2,$3/,
-	    $ct->argv(qw(des -l -ahl), $eqhl, "lbtype:$t")->stderr(0)->qx;
+	    $ct->argv(qw(des -l -ahl), $eqhl, $pt)->stderr(0)->qx;
 	  my ($hlk, $prev, $vob) = split ',', $pair if $pair;
 	  next unless $prev;
 	  if ($prev =~ /^(.*)_(\d+)(?:\.(\d+))?$/) {
@@ -968,8 +1035,9 @@ sub _Mklbtype {
   }
 }
 sub mklbtype {
-  my %opt;
+  my (%opt, $rep);
   GetOptions(\%opt, qw(family increment archive));
+  GetOptions('replace' => \$rep);
   return if !%opt and grep /^-(ord|glo)/, @ARGV;
   die Msg('E', 'Incompatible options: family increment archive')
     if keys %opt > 1;
@@ -981,6 +1049,7 @@ sub mklbtype {
 		   pbranch|shared gt|ge|lt|le|enum|default|vtype=s
 		   cquery|cqeach nc c|cfile=s));
   $ntype->{fopts} = \%opt;
+  $ntype->{rep} = $rep;
   _Preemptcmt($ntype, \&_Mklbtype);
 }
 
@@ -1043,8 +1112,13 @@ sub lock {
 	     (!$currlock or $opt{iflocked}) or $lock->flag('replace')) {
     $lock->opts($lock->opts, '-nusers', ($nusers or $opt{allow}));
   }
-  $lock->opts($lock->opts, '-replace')
-    if ($opt{allow} or $opt{deny}) and $currlock and !$lock->flag('replace');
+  if ($currlock and !$lock->flag('replace')) {
+    if ($opt{allow} or $opt{deny}) {
+      $lock->opts($lock->opts, '-replace')
+    } else {
+      die Msg('E', 'Object is already locked.');
+    }
+  }
   my @args = $lock->args;
   $ct = ClearCase::Argv->new({autochomp=>1});
   my (@lbt, @oth, %vob);
@@ -1084,18 +1158,23 @@ sub lock {
   my ($fl, $loaded) = $ENV{FORCELOCK};
   for my $lt (@lbt) {
     my $v = $vob{$lt};
-    if ($lock->args("lbtype:$lt\@$v")->stderr(0)->system) {
+    my @out = $lock->args("lbtype:$lt\@$v")->stderr(1)->qx;
+    if (grep /^cleartool: Error/, @out) {
       if ($fl and !$loaded) {
 	my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
 	require $fn;
 	$fl->import;
 	$loaded = 1;
       }
-      if (!$fl or flocklt($lt, $v, $lock->flag('replace'),
-			  ($nusers or $opt{allow}))) {
-	warn Msg('E', "Could not lock lbtype:$lt\@$v");
+      if (!$fl) {
+	print @out;
+	$rc = 1;
+      } elsif (flocklt($lt, $v, $lock->flag('replace'),
+		       ($nusers or $opt{allow}))) {
 	$rc = 1;
       }
+    } else {
+      print @out;
     }
   }
   exit $rc;
@@ -1144,17 +1223,22 @@ sub unlock() {
   for my $lt (@lbt) {
     my $v = $vob{$lt};
     if ($ct->argv(qw(lslock -s), "lbtype:$lt\@$v")->qx) {
-      if ($unlock->args("lbtype:$lt\@$v")->stderr(0)->system) {
+      my @out = $unlock->args("lbtype:$lt\@$v")->stderr(1)->qx;
+      if (grep /^cleartool: Error/, @out) {
 	if ($fl and !$loaded) {
 	  my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
 	  require $fn;
 	  $fl->import;
 	  $loaded = 1;
 	}
-	if (!$fl or funlocklt($lt, $v)) {
-	  warn Msg('E', "Could not unlock lbtype:$lt\@$v");
+	if (!$fl) {
+	  print @out;
+	  $rc = 1;
+	} elsif	(funlocklt($lt, $v)) {
 	  $rc = 1;
 	}
+      } else {
+	print @out;
       }
     } else {
       warn Msg('E', 'Object is not locked.');
@@ -1188,6 +1272,12 @@ the labels will be applied over the result of a find command run on the
 unique version argument, and looking for versions matching respectively
 B<lbtype(xxx)> or <version(.../xxx/LATEST)> queries, and B<!lbtype(lb)> (with
 I<xxx> the B<-over>, and I<lb> the main label type parameter.
+Internally B<-over> performs a B<find>. This one depends by default on the
+current config spec, with the result that it is not guaranteed to reach all
+the versions specified, at least in the first pass. One may thus use an B<-all>
+option which will be passed to the B<find>.
+The B<-over> option doesn't require an element argument (default: current
+directory). With the B<-all> option, it uses one if given, as a filter.
 
 =cut
 
@@ -1195,30 +1285,47 @@ sub mklabel {
   use warnings;
   use strict;
   my %opt;
-  GetOptions(\%opt, qw(up force over=s));
+  GetOptions(\%opt, qw(up force over=s all));
   ClearCase::Argv->ipc(1);
   my $mkl = ClearCase::Argv->new(@ARGV);
   $mkl->parse(qw(replace|recurse|ci|cq|nc
 		 version|c|cfile|select|type|name|config=s));
   my @opt = $mkl->opts();
+  die Msg('E', 'all is only supported in conjunction with over')
+    if $opt{all} and !$opt{over};
   die Msg('E', 'Incompatible flags: up and config')
     if $opt{up} and grep /^-con/, @opt;
   die Msg('E', 'Incompatible flags: recurse and over')
     if $opt{over} and grep /^-r(ec|$)/, @opt;
   die Msg('E', 'Incompatible flags: up and over') if $opt{up} and $opt{over};
   my($lbtype, @elems) = $mkl->args;
-  die Msg('E', "Only one version argument with the over flag: ")
+  die Msg('E', 'Only one version argument with the over flag')
     if $opt{over} and scalar @elems > 1;
+  die Msg('E', 'Label type required') unless $lbtype;
   $lbtype =~ s/^lbtype://;
   $ct = ClearCase::Argv->new({autochomp=>1});
-  my $fail = $ct->clone({autofail=>1});
-  $fail->argv(qw(des -s), @elems)->stdout(0)->system;
+  my (%vb, @lt);
+  for my $e (@elems?@elems:qw(.)) {
+    my $v = $ct->argv(qw(des -s), "vob:$e")->stderr(0)->qx;
+    $vb{$v}++ if $v;
+  }
+  if ($lbtype =~ /@/) {
+    push @lt, $lbtype;
+  } else {
+    push @lt, "$lbtype\@$_" for keys %vb;
+  }
+  my @lt1 = @lt;
   my @et = grep s/^-> lbtype:(.*)@.*$/$1/,
-    $ct->argv(qw(des -s -ahl), $eqhl, "lbtype:$lbtype")->qx;
+    map { $ct->argv(qw(des -s -ahl), $eqhl, "lbtype:$_")->qx } @lt1;
   return 0 unless $opt{up} or $opt{over} or @et;
-  die Msg('E',
-	  "Lock on label type \"$lbtype\" prevents operation \"make label\"")
-    if $ct->argv(qw(lslock -s),"lbtype:$lbtype")->stderr(0)->qx;
+  my $fail = $ct->clone({autofail=>1});
+  $fail->argv(qw(des -s), @elems)->stdout(0)->system
+    unless $opt{over} and !@elems; #eq fixed => 1 failure fails all
+  die Msg('E', "Only one vob supported for family types") if @et > 1;
+  map {
+    die Msg('E', qq(Lock on label type "$_" prevents operation "make label"))
+      if $ct->argv(qw(lslock -s),"lbtype:$_")->stderr(0)->qx
+    } @lt;
   my ($ret, @rec, @mod) = 0;
   if (grep /^-r(ec|$)/, @opt) {
     if (@et) {
@@ -1231,7 +1338,8 @@ sub mklabel {
     my ($t, $ver, $lb) = ($opt{over}, $elems[0]);
     die Msg('E', 'The -over flag requires a local type argument')
       if !$t or $t =~ /\@/;
-    my $vob = $fail->argv(qw(des -s), "vob:$ver")->qx;
+    my $base = $ver || '.';
+    my $vob = $fail->argv(qw(des -s), "vob:$base")->qx;
     if ($t =~ /lbtype:(.*)$/) {
       $t = $1; $lb = 1;
       die unless $ct->argv(qw(des -s), "lbtype:$t\@$vob")->qx;
@@ -1249,7 +1357,13 @@ sub mklabel {
     }
     my $query = $lb? "lbtype($t)" : "version(.../$t/LATEST)";
     $query .= " \&\&! lbtype($lbtype)";
-    @mod = $ct->argv('find', $ver, '-ver', $query, '-print')->stderr(0)->qx;
+    $base = '-a' if $opt{all};
+    @mod = $ct->argv('find', $base, '-ver', $query, '-print')->stderr(0)->qx;
+    if ($opt{all} and $ver) {
+      use File::Spec::Functions qw(rel2abs);
+      $ver = rel2abs($ver);
+      @mod = grep /^${ver}(\W|$)/, @mod;
+    }
   }
   $mkl->opts(grep !/^-r(ec|$)/, @opt); # recurse handled already
   @opt = $mkl->opts;
@@ -1299,6 +1413,83 @@ sub mklabel {
   $mkl->opts(@opt);
   $ret |= $mkl->args($lbtype, @mod)->system;
   exit $ret;
+}
+
+=item * CI/CHECKIN
+
+Extended to handle the B<-dir/-rec/-all/-avobs> flags. These are fairly
+self-explanatory but for the record B<-dir> checks in all checkouts in
+the current directory, B<-rec> does the same but recursively down from
+the current directory, B<-all> operates on all checkouts in the current
+VOB, and B<-avobs> on all checkouts in any VOB.
+
+Extended to allow B<symbolic links> to be checked in (by operating on
+the target of the link instead).
+
+Extended to implement a B<-diff> flag, which runs a B<I<diff -pred>>
+command before each checkin so the user can review his/her changes
+before typing the comment.
+
+Implements a new B<-revert> flag. This causes identical (unchanged)
+elements to be unchecked-out instead of being checked in.
+
+Since checkin is such a common operation, a special fature is supported
+to save typing: an unadorned I<ci> cmd is C<promoted> to I<ci -dir -me
+-diff -revert>. In other words typing I<ct ci> will step through each
+file checked out by you in the current directory and view,
+automatically undoing the checkout if no changes have been made and
+showing diffs followed by a checkin-comment prompt otherwise.
+
+[ From David Boyce's ClearCase::Wrapper. Adapted to user interactions
+preempting. ]
+
+=cut
+
+sub checkin {
+  use strict;
+  use warnings;
+  # Allows 'ct ci' to be shorthand for 'ct ci -me -diff -revert -dir'.
+  push(@ARGV, qw(-me -diff -revert -dir)) if grep(!/^-pti/, @ARGV) == 1;
+  # -re999 isn't a real flag, it's to disambiguate -rec from -rev. Id. -cr999.
+  my %opt;
+  GetOptions(\%opt, qw(crnum=s cr999=s diff ok revert re999))
+    if grep /^-(crn|dif|ok|rev)/, @ARGV;
+  ClearCase::Argv->ipc(1);
+  # This is a hidden flag to support DB's checkin_post trigger.
+  # It allows the bug number to be supplied as a cmdline option.
+  $ENV{CRNUM} = $opt{crnum} if $opt{crnum};
+  my $ci = ClearCase::Argv->new(@ARGV);
+  # Parse checkin and (potential) diff flags into different optsets.
+  $ci->parse(qw(cquery|cqeach nc c|cfile=s
+		nwarn|cr|ptime|identical|cact|cwork keep|rm from=s));
+  if ($opt{'diff'} || $opt{revert}) {
+    $ci->optset('DIFF');
+    $ci->parseDIFF(qw(serial_format|diff_format|window columns|options=s
+		      graphical|tiny|hstack|vstack|predecessor));
+  }
+  # Now do auto-aggregation on the remaining args.
+  my @elems = AutoCheckedOut($opt{ok}, $ci->args); # may exit
+  # Turn symbolic links into their targets so CC will "do the right thing".
+  for (@elems) {
+    $_ = readlink if -l && defined readlink;
+  }
+  $ci->args(@elems);
+  # Give a warning if the file is open for editing by vim.
+  # (DB knows, there are lots of other editors but it just happens
+  # to be easy to detect vim by its .swp file)
+  for (@elems) {
+    die Msg('E', "$_: appears to be open in vim!") if -f ".$_.swp";
+  }
+  if ($opt{diff} or $opt{revert}) {
+    # In case ~/.clearcase_profile makes ci -nc the default, make sure
+    # we prompt for a comment - unless checking in dirs only.
+    if (!grep(/^-c|^-nc$/, $ci->opts) && grep(-f, @elems)) {
+      $ci->opts('-cqe', $ci->opts);
+      $ci->{AV_LKG}{''}{cquery}=1;
+    }
+  }
+  $ci->{opthashre} = \%opt;
+  _Preemptcmt($ci, \&_Checkin, \&_PreCi);
 }
 
 =back
