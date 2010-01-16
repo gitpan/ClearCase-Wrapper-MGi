@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.16';
+$VERSION = '0.17';
 
 use warnings;
 use strict;
@@ -15,7 +15,7 @@ sub _Compareincs($$) {
     warn Msg('W', "$t1 and $t2 not comparable\n");
     return 1;
   }
-  return (($M1 <=> $M2) or (defined($m1) and defined($m2) and $m1 <=> $m2));
+  return ($M1 <=> $M2 or (defined($m1) and defined($m2) and $m1 <=> $m2));
 }
 use AutoLoader 'AUTOLOAD';
 
@@ -347,8 +347,9 @@ sub _PreCi {
   use strict;
   use warnings;
   my ($ci, @arg) = @_;
-  my $lsco = ClearCase::Argv->lsco([qw(-cview -s)])->stderr(1);
-  if (!$lsco->args(@arg)->qx) {
+  my $lsco = ClearCase::Argv->lsco([qw(-cview -s -d)])->stderr(1);
+  my $res = $lsco->args(@arg)->qx;
+  if (!$res or $res =~ /^cleartool: Error/m) {
     warn Msg('E', 'Unable to find checked out version for '
 	       . join(', ', @arg) . "\n");
     return 0;
@@ -356,14 +357,22 @@ sub _PreCi {
   my $opt = $ci->{opthashre};
   return 1 unless $opt->{diff} || $opt->{revert};
   my $elem = $arg[0]; #Only one because of -cqe
-  # Make sure the -pred flag is there as we're going one at a time.
   my $diff = $ci->clone->prog('diff');
-  $diff->optsDIFF(qw(-pred -serial), $diff->optsDIFF);
+  $ct = $ci->clone;
+  $ct->autochomp(1);
+  my $ver = $ct->argv(qw(des -fmt %En@@%Vn), $elem)->qx;
+  $ver =~ s%\\%/%g;
+  my $bra = $1 if $ver =~ m%^(.*?)/(?:\d+|CHECKEDOUT)$%;
+  my %gen = _Parsevtree($elem, 1, $ver);
+  my $p = $gen{$ver}{'parents'};
+  my ($brp) = grep { m%^$bra/\d+$% } @{$p};
+  $diff->optsDIFF(q(-serial), $diff->optsDIFF);
+  $diff->args($brp? $brp : $p->[0], $elem);
   # Without -diff we only care about return code
   $diff->stdout(0) unless $opt->{diff};
   # With -revert, suppress msgs from typemgrs that don't do diffs
   $diff->stderr(0) if $opt->{revert};
-  if ($diff->args($elem)->system('DIFF')) {
+  if ($diff->system('DIFF')) {
     return 1;
   } else {
     if ($opt->{revert}) { # unco instead of checkin
@@ -443,10 +452,11 @@ sub _Preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
     }
   } elsif ($cqf) {
     my $cqe = grep /^-cqe/, @opts;
-    $cmd->opts(grep !/^-cq/, @opts);
+    @opts = grep !/^-cq/, @opts;
     my @arg = $cmd->args;
     my $go = 1;
     while ($go) {
+      $cmd->opts(@opts); #reset
       if ($cqe) {
 	my $arg = shift @arg;
 	$go = scalar @arg;
@@ -502,6 +512,7 @@ sub _Yesno {
   my $ret = 0;
   my @opts = $cmd->opts;
   for my $arg ($cmd->args) {
+    $cmd->opts(@opts); #reset
     if ($test) {
       my $res = $test->args($arg)->qx;
       if (!$res or $res =~ /^cleartool: Error:/) {
@@ -518,8 +529,7 @@ sub _Yesno {
       $ans = $yn->{default} unless $ans;
     }
     if ($yn->{opt}->{$ans}) {
-      push @opts, $yn->{opt}->{$ans};
-      $cmd->opts(@opts);
+      $cmd->opts(@opts, $yn->{opt}->{$ans});
       $cmd->args($arg);
       $ret |= &{$fn}($cmd);
     } else {
@@ -942,7 +952,7 @@ sub _GenMkTypeSub {
 	return $ntype->system;
       }
     } elsif (%opt) {
-      map { s/^$ {type}:(.*)$/$1/ } @args;
+      map { s/^${type}:(.*)$/$1/ } @args;
       my @a = @args;
       my @vob = grep { s/.*\@(.*)$/$1/ } @a;
       push @vob, $ct->argv(qw(des -s vob:.))->stderr(0)->qx
@@ -1042,32 +1052,76 @@ sub _GenMkTypeSub {
 	    }
 	  } keys %pair;
 	} elsif ($opt{increment}) { # increment
-	  for my $t (@args) {
-	    my $pt = "$type:$t";
+	  INCT: for my $t (@args) {
+	    my ($pt, $lck) = "$type:$t";
 	    if (!$ct->argv(qw(des -s), $pt)->stderr(0)->qx) {
 	      warn Msg('E', qq($Name type not found: "$t"));
-	      next;
-	    } elsif ($ct->argv(qw(lslock -s), $pt)->stderr(0)->qx) {
-	      warn Msg('E', qq(Lock on $name type "$t" )
-			 . qq(prevents operation "make $type"));
 	      next;
 	    }
 	    my ($pair) = grep s/^\s*(.*) -> $type:(.*)\@(.*)$/$1,$2,$3/,
 	      $ct->argv(qw(des -l -ahl), $eqhl, $pt)->stderr(0)->qx;
 	    my ($hlk, $prev, $vob) = split ',', $pair if $pair;
-	    next unless $prev;
+	    next INCT unless $prev;
+	    my $lct = ClearCase::Argv->new(); #Not autochomp
+	    my ($fl, $loaded) = $ENV{FORCELOCK};
+	    my ($t1) = $t =~ /^(.*?)(@|$)/;
+	    for my $l ($t1, $prev) {
+	      if ($ct->argv(qw(lslock -s), "lbtype:$l\@$vob")->stderr(0)->qx) {
+		$lck = 1; #remember to lock the equivalent fixed type
+		#This should happen as vob owner, to retain the timestamp
+		my @out =
+		  $lct->argv('unlock', "lbtype:$l\@$vob")->stderr(1)->qx;
+		if (grep /^cleartool: Error/, @out) {
+		  if ($fl and !$loaded) {
+		    my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
+		    require $fn;
+		    $fl->import;
+		    $loaded = 1;
+		  }
+		  if (!$fl) {
+		    print @out;
+		    next INCT;
+		  } elsif (funlocklt($l, $vob)) {
+		    next INCT;
+		  }
+		} else {
+		  print @out;
+		}
+	      }
+	    }
 	    if ($prev =~ /^(.*)_(\d+)(?:\.(\d+))?$/) {
 	      my ($base, $maj, $min) = ($1, $2, $3);
 	      my $new = "${base}_" .
 		(defined($min)? $maj . '.' . ++$min : ++$maj);
-	      map { $_ .= $1 } ($new, $prev) if $t =~ /^.*(@.*)$/;
+	      my $p1 = $prev;
+	      map { $_ .= $1 } ($new, $p1) if $t =~ /^.*(@.*)$/;
 	      $ntype->opts(@cmt, $ntype->opts);
-	      $ntype->args($new)->system;
+	      $ntype->args($new)->system and exit 1;
 	      $silent->argv('rmhlink', $hlk)->system;
 	      $silent->argv(qw(mkhlink -nc), $eqhl,
 			    "$type:$t", "$type:$new")->system;
 	      $silent->argv(qw(mkhlink -nc), $prhl,
-			    "$type:$new", "$type:$prev")->system;
+			    "$type:$new", "$type:$p1")->system;
+	      if ($lck) {
+		my @out =
+		  $lct->argv('lock', "lbtype:$prev\@$vob")->stderr(1)->qx;
+		if (grep /^cleartool: Error/, @out) {
+		  if ($fl and !$loaded) {
+		    my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
+		    require $fn;
+		    $fl->import;
+		    $loaded = 1;
+		  }
+		  if (!$fl) {
+		    print @out;
+		    next INCT;
+		  } elsif (flocklt($prev, $vob)) {
+		    next INCT;
+		  }
+		} else {
+		  print @out;
+		}
+	      }
 	    } else {
 	      warn "Previous increment non suitable in $t: $prev\n";
 	      next;
@@ -1457,7 +1511,8 @@ sub mklabel {
   my ($ret, @rec, @mod) = 0;
   if (grep /^-r(ec|$)/, @opt) {
     if (@et) {
-      @rec = grep /@@/, $ct->argv(qw(ls -s -r -vob), @elems)->qx;
+      #The -vob_only flag would hide the checkout info for files
+      @rec = grep m%@@[/\\]%, $ct->argv(qw(ls -s -r), @elems)->qx;
     } else {
       $mkl->syfail(1) unless $opt{force};
       $ret = $mkl->system;
@@ -1494,7 +1549,6 @@ sub mklabel {
     }
   }
   $mkl->opts(grep !/^-r(ec|$)/, @opt); # recurse handled already
-  @opt = $mkl->opts;
   if ($opt{up}) {
     my $dsc = ClearCase::Argv->new({-autochomp=>1});
     require File::Basename;
@@ -1521,11 +1575,12 @@ sub mklabel {
     if (@et) {
       push @elems, sort {$b cmp $a} keys %ancestors;
     } else {
+      @elems = () if grep /^-r(ec|$)/, @opt; #already labelled
+      push @elems, sort {$b cmp $a} keys %ancestors;
       $ret |= $mkl->args($lbtype, @elems)->system;
       exit $ret;
     }
   }
-  # Necessarily in the incremental type case
   if (!$opt{over}) {
     push @elems, @rec;
     @mod = grep {
@@ -1537,7 +1592,8 @@ sub mklabel {
   exit $ret unless @mod;
   $ret = $mkl->args($et[0], @mod)->system if @et;
   exit $ret if $ret and !$opt{force};
-  push @opt, '-rep' unless grep /^-rep/, @opt;
+  @opt = $mkl->opts;
+  push @opt, '-rep' if @et and !grep /^-rep/, @opt; #implicit for floating
   $mkl->opts(@opt);
   $ret |= $mkl->args($lbtype, @mod)->system;
   exit $ret;
