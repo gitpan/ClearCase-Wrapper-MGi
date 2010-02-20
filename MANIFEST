@@ -13,4 +13,5 @@ extra/VobPathConv.pm
 extra/VobPathConv.pod
 extra/locklbtype
 extra/locklbtype.pod
+extra/updtlink
 META.yml                                 Module meta-data (added by MakeMaker)
