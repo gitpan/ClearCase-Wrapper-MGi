@@ -1,11 +1,11 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.20';
+$VERSION = '0.21';
 
 use warnings;
 use strict;
 use vars qw($ct $eqhl $prhl $diat);
-($eqhl, $prhl, $diat) = qw(EqInc PrevInc DelInc);
+($eqhl, $prhl) = qw(EqInc PrevInc);
 
 sub _Compareincs($$) {
   my ($t1, $t2) = @_;
@@ -272,8 +272,11 @@ sub _Mkbco {
       }
     } else {
       my @args;
-      push @args, @opts, @cmt, $e; # Ensure non empty array
-      $rc |= $ct->argv('co', @args)->system;
+      push @args, @opts, @cmt;
+      push @args, $bt if $bt;
+      push @args, $e; # Ensure non empty array
+      $rc |= $bt? $ct->argv('mkbranch', @args)->system
+	: $ct->argv('co', @args)->system;
     }
   }
   return $rc;
@@ -281,8 +284,7 @@ sub _Mkbco {
 sub _Ensuretypes($@) {
   my ($glb, @vob) = @_;
   my %cmt = ($eqhl => q(Equivalent increment),
-	     $prhl => q(Previous increment in a type chain),
-	     $diat => q(Deleted in increment));
+	     $prhl => q(Previous increment in a type chain));
   my $silent = $ct->clone;
   $silent->stdout(0);
   $silent->stderr(0);
@@ -291,14 +293,9 @@ sub _Ensuretypes($@) {
     for my $v (@vob) {
       my $t2 = "$t\@$v";
       if ($silent->argv(qw(des -s), "hltype:$t2")->system) {
-	$ct->argv(qw(mkhltype -c), $cmt{$t}, $gflg, $t2)->system and die;
+	$ct->argv(qw(mkhltype -shared -c), $cmt{$t}, $gflg, $t2)->system
+	  and die;
       }
-    }
-  }
-  for my $v (@vob) {
-    if ($silent->argv(qw(des -s), "attype:$diat\@$v")->system) {
-      $ct->argv(qw(mkattype -c), $cmt{$diat}, $gflg, "$diat\@$v")->system
-	and die;
     }
   }
 }
@@ -566,6 +563,27 @@ sub _Checkin {
     return $ci->system;
   }
 }
+# Input: lbtype type, either floating 'family' type, or fixed
+# 'incremental'.
+# Output: ordered list of short type names, as chained.
+sub _EqLbTypeList {
+  use strict;
+  use warnings;
+  my $top = shift;
+  return unless $top;
+  $top = "lbtype:$top" unless $top =~ /^lbtype:/;
+  my $ct = ClearCase::Argv->new({autochomp=>1});
+  my ($eq) = grep s/^-> (.*)$/$1/,
+    $ct->argv(qw(des -s -ahl), $eqhl, $top)->qx;
+  $_ = $eq? $eq : $top;
+  my @list;
+  do {
+    push @list, $1 if /^lbtype:(.*?)(@.*)?$/;
+    ($_) = grep s/^-> (.*)$/$1/,
+      $ct->argv(qw(des -s -ahl), $prhl, $_)->qx;
+  } while ($_);
+  return @list;
+}
 
 =head1 NAME
 
@@ -582,7 +600,7 @@ of incremental types.
 
 =head1 CLEARTOOL EXTENSIONS
 
-=over 12
+=over 14
 
 =item * LSGENEALOGY
 
@@ -765,7 +783,7 @@ sub mkbranch {
     }
   }
   for (keys %v) {
-    die if $ct->argv(qw(des -s), "brtype:$bt$_")->stdout(0)->system;
+    die "\n" if $ct->argv(qw(des -s), "brtype:$bt$_")->stdout(0)->system;
   }
   $mkbranch->args(@args);
   $mkbranch->{bt} = $bt;
@@ -913,15 +931,10 @@ Previous incremental fixed type.
 
 =back
 
-One attribute:
-
-=over 1
-
-=item B<DelInc>
-
-Deleted from increment. This functionality is not implemented yet.
-
-=back
+Attributes are created of a per label family type, and are used to
+mark the deletion of labels applied at a previous increment.  The
+attribute type for family lbtype I<XXX> is I<RmXXX>, and the value is
+the numeric (treated as I<real>) value of the increment.
 
 Flags:
 
@@ -934,6 +947,8 @@ The first, given as argument, will be considered as an alias for successive
 increments of the second. It is the I<family> type.
 The name of the initial incremental type is this of the I<family> type, with
 a suffix of I<_1.00>.
+
+Also create a I<RmLBTYPE> attribute type to record removals of labels.
 
 =item B<-inc/rement>
 
@@ -951,6 +966,10 @@ archived one its predecessor, with a B<PrevInc> hyperlink.
 Comments go to the type being archived.
 
 The implementation is largely shared with I<mkbrtype>.
+
+For label types, the newly created type is hidden away (with a suffix
+of I<_0>) and locked. It is being restored the next time C<mklbtype -fam>
+is given for the same name.
 
 =item B<-glo/bal>
 
@@ -994,7 +1013,7 @@ sub _GenMkTypeSub {
       }
       if (scalar keys %avob) {
 	$ntype->opts('-global', $ntype->opts);
-	for (@vob) { #Fix the vobs, to ensure the metadata types
+	for (@vob) {	   #Fix the vobs, to ensure the metadata types
 	  $_ = $avob{$_} if $avob{$_};
 	}
 	for (@args) { #Fix the types, to create them in the admin vob(s)
@@ -1066,6 +1085,12 @@ sub _GenMkTypeSub {
 	    $ntype->system;
 	    my $at = "$type:${arc}$vob";
 	    $silent->argv('mkhlink', $prhl, $t, $at)->system;
+	    if ($type eq 'lbtype') {
+	      my $t0 = $t;
+	      $t0 =~ s/^lbtype:(.*)(@.*)$/lbtype:$ {1}_0$2/;
+	      $ct->argv('rename', $t, $t0)->system;
+	      $ct->argv('lock', $t0)->system;
+	    }
 	    $ct->argv('chevent', @cmt, $at)->stdout(0)->system
 	      unless $cmt[0] and $cmt[0] =~ /^-nc/;
 	  }
@@ -1079,10 +1104,20 @@ sub _GenMkTypeSub {
 	  map { $_ = "$type:$_" } @a;
 	  die Msg('E', "Some types already exist among @args")
 	    unless $silent->argv(qw(des -s), @a)->stderr(0)->system;
-	  my %pair = ();
-	  foreach (@args) {
-	    if (/^(.*?)(@.*)?$/) {
-	      $pair{$_} = "${1}_1.00" . ($2? $2:'');
+	  my (%pair, @skip) = ();
+	TYPE: foreach my $t (@args) {
+	    if ($t =~ /^(.*?)(@.*)?$/) {
+	      my ($pfx, $sfx) = ($1, $2?$2:'');
+	      if ($type eq 'lbtype') {
+		my $t0 = "lbtype:${pfx}_0$sfx";
+		if ($ct->argv(qw(des -s), $t0)->stderr(0)->qx) {
+		  $ct->argv('unlock', $t0)->system;
+		  $ct->argv('rename', $t0, "lbtype:$t")->stderr(0)->system
+		    and die Msg('E', qq(Failed to restore "$t0" into "$t".));
+		  push @skip, $t;
+		}
+	      }
+	      $pair{$t} = "${pfx}_1.00$sfx";
 	    }
 	  }
 	  _Findfreeinc(\%pair);
@@ -1090,20 +1125,34 @@ sub _GenMkTypeSub {
 	  $ntype->args(values %pair);
 	  $ntype->opts(@cmt, @opts);
 	  $ntype->system;
-	  $ntype->args(@args);
-	  $ntype->opts('-nc', @opts);
-	  $ntype->system;
-	  map {
+	  if (@skip) {
+	    my $sk = '(' . join('|', @skip) . ')';
+	    @a = grep !/$sk/, @args;
+	  } else {
+	    @a = @args;
+	  }
+	  if (@a) {
+	    $ntype->args(@a);
+	    $ntype->opts('-nc', @opts);
+	    $ntype->system;
+	  }
+	  my $gflg = (grep /^-glo/, $ntype->opts)? '-glo' : '-ord';
+	  for (keys %pair) {
 	    if (defined($pair{$_})) {
 	      my $inc = "$type:$pair{$_}";
 	      $silent->argv('mkhlink', $eqhl, "$type:$_", $inc)->system;
+	      next if $ntype eq 'mkbrtype';
+	      my $att = "Rm$_";
+	      $ct->argv(qw(mkattype -shared -vtype real -c),
+			q(Deleted in increment), $gflg, "$att")->system
+			  and die "\n";
 	    }
-	  } keys %pair;
+	  }
 	} elsif ($opt{increment}) { # increment
 	  $ntype->opts(@cmt, $ntype->opts);
 	  my $lct = ClearCase::Argv->new(); #Not autochomp
 	  my ($fl, $loaded) = $ENV{FORCELOCK};
-	  INCT: for my $t (@args) {
+	INCT: for my $t (@args) {
 	    my ($pt, $lck) = "$type:$t";
 	    if (!$ct->argv(qw(des -s), $pt)->stderr(0)->qx) {
 	      warn Msg('E', qq($Name type not found: "$t"));
@@ -1119,7 +1168,7 @@ sub _GenMkTypeSub {
 	    my ($t1) = $t =~ /^(.*?)(@|$)/;
 	    for my $l ($t1, $prev) {
 	      if ($ct->argv(qw(lslock -s), "lbtype:$l\@$vob")->stderr(0)->qx) {
-		$lck = 1; #remember to lock the equivalent fixed type
+		$lck = 1;  #remember to lock the equivalent fixed type
 		#This should happen as vob owner, to retain the timestamp
 		my @out =
 		  $lct->argv('unlock', "lbtype:$l\@$vob")->stderr(1)->qx;
@@ -1475,7 +1524,7 @@ sub unlock() {
 	if (!$fl) {
 	  print @out;
 	  $rc = 1;
-	} elsif	(funlocklt($lt, $v)) {
+	} elsif (funlocklt($lt, $v)) {
 	  $rc = 1;
 	}
       } else {
@@ -1529,8 +1578,8 @@ sub mklabel {
   GetOptions(\%opt, qw(up force over=s all));
   ClearCase::Argv->ipc(1);
   my $mkl = ClearCase::Argv->new(@ARGV);
-  $mkl->parse(qw(replace|recurse|ci|cq|nc
-		 version|c|cfile|select|type|name|config=s));
+  $mkl->parse(qw(replace|recurse|follow|ci|cq|nc
+		 version=s c|cfile|select|type|name|config=s));
   my @opt = $mkl->opts();
   die Msg('E', 'all is only supported in conjunction with over')
     if $opt{all} and !$opt{over};
@@ -1615,11 +1664,11 @@ sub mklabel {
     File::Spec->VERSION(0.82);
     my $vroot;
     if ($^O eq 'cygwin') {
-      $vroot = '/cygdrive/a'; #just for the length
+      $vroot = '/cygdrive/a';	#just for the length
     } elsif ($^O =~ /MSWin/) {
       $vroot = 'a:';
     } else {
-       $vroot = $ct->argv(qw(pwv -root))->qx;
+      $vroot = $ct->argv(qw(pwv -root))->qx;
     }
     my %ancestors;
     for my $pname (@elems) {
@@ -1649,12 +1698,22 @@ sub mklabel {
     } @elems;
   }
   exit $ret unless @mod;
-  $ret = $mkl->args($et[0], @mod)->system if @et;
-  exit $ret if $ret and !$opt{force};
-  @opt = $mkl->opts;
-  push @opt, '-rep' if @et and !grep /^-rep/, @opt; #implicit for floating
-  $mkl->opts(@opt);
-  $ret |= $mkl->args($lbtype, @mod)->system;
+  my $rmattr = ClearCase::Argv->rmattr([("Rm$lbtype")]);
+  my @raopts = $rmattr->opts;
+  push(@raopts, '-ver', $mkl->flag('version')) if $mkl->flag('version');
+  $rmattr->opts(@raopts);
+  for (@mod) {
+    if (@et) {
+      my $rc = $mkl->args($et[0], $_)->system;
+      $ret |= $rc;
+      next if $rc and !$opt{force};
+      $rmattr->args($_)->stderr(0)->system unless $rc;
+    }
+    @opt = $mkl->opts;
+    push @opt, '-rep' if @et and !grep /^-rep/, @opt; #implicit for floating
+    $mkl->opts(@opt);
+    $ret |= $mkl->args($lbtype, $_)->system;
+  }
   exit $ret;
 }
 
@@ -1745,7 +1804,7 @@ sub checkin {
 
 No semantic change. This implementation is only needed to handle the
 optional interactive dialog in the context of the ipc mode of the
-underlying I<ClearCase::Argv>, to work around a bug in I<cleartool status>.
+underlying I<ClearCase::Argv>.
 
 =cut
 
@@ -1775,6 +1834,195 @@ sub rmbranch {
     my $run = sub { my $rmbranch = shift; $rmbranch->system };
     _Yesno($rmbranch, $run, \%yn, $exists, $err);
   }
+}
+
+=item * RMLABEL
+
+For family types, remove both types, and add a I<RmLBTYPE> attribute
+mentioning the increment of the removal of the LBTYPE label, for use
+in config specs based on sparse fixed types equivalent to a given
+state of the floating type.
+
+=cut
+
+sub rmlabel {
+  use strict;
+  use warnings;
+  my $rmlabel = ClearCase::Argv->new(@ARGV);
+  $rmlabel->parse(qw(cquery|cqeach nc c|cfile=s recurse follow version=s));
+  my($lbtype, @elems) = $rmlabel->args;
+  $ct = ClearCase::Argv->new({autochomp=>1});
+  if (!($lbtype and @elems)) {
+    warn Msg('E', 'Type name required') unless $lbtype;
+    warn Msg('E', 'Element pathname required') unless @elems;
+    $ct->argv(qw(help rmlabel))->system;
+    exit 1;
+  }
+  if (MSWIN) {
+    $_ = glob($_) for @elems;
+  }
+  $lbtype =~ s/^lbtype://;
+  my (%vb, @lt, %et);
+  for my $e (@elems) {
+    my $v = $ct->argv(qw(des -s), "vob:$e")->stderr(0)->qx;
+    $vb{$v}++ if $v;
+  }
+  if ($lbtype =~ /@(.*)$/) {
+    my ($v, @v) = ($1, keys %vb);
+    die Msg('E', qq(Object is in unexpected VOB: "$lbtype".))
+      if scalar @v > 1 or (scalar @v == 1 and $v !~ /^$v[0]/);
+    push @lt, $lbtype;
+  } else {
+    push @lt, "$lbtype\@$_" for keys %vb;
+  }
+  $et{$_}++ for grep s/^-> lbtype:(.*)@.*$/$1/,
+    map { $ct->argv(qw(des -s -ahl), $eqhl, "lbtype:$_")->qx } @lt;
+  my @et = keys %et;
+  die Msg('E', qq("$lbtype" must have the same equivalent type in all vobs.))
+    if scalar @et > 1;
+  my $et = (scalar @et == 1)? $et[0] : '';
+  my $fn = sub {
+    my ($rml, @cmt) = @_;
+    my @opts = $rml->opts;
+    my @opcm = @opts;
+    push @opcm, @cmt;
+    my $rc = 0;
+    for (@elems) {
+      $rml->opts(@opcm);
+      $rml->args($lbtype, $_);
+      my $r1 = $rml->system;
+      if ($et) {
+	my $att = "Rm$lbtype";
+	my $val = $et;
+	$val =~ s/^.*_//;
+	$ct->argv('mkattr', $att, $val, $_)->system
+	  unless $r1 or $ct->argv(qw(des -fmt), qq(\%\[$att\]NSa), $_)->qx;
+	$rml->opts(@opts);
+	$rml->args($et, $_);
+	$r1 |= $rml->system;
+      }
+      $rc |= $r1;
+    }
+    return $rc;
+  };
+  _Preemptcmt($rmlabel, $fn);
+}
+
+=item * SETCS
+
+From the version in DSB.pm 1.14--retaining its additions:
+
+Adds a B<-clone> flag which lets you specify another view from which
+to copy the config spec.
+
+Adds a B<-sync> flag. This is similar to B<-current> except that it
+analyzes the CS dependencies and only flushes the view cache if the
+I<compiled_spec> file is out of date with respect to the
+I<config_spec> source file or any file it includes. In other words:
+B<setcs -sync> is to B<setcs -current> as B<make foo.o> is to
+B<cc -c foo.c>.
+
+Adds a B<-needed> flag. This is similar to B<-sync> above but it
+doesn't recompile the config spec. Instead, it simply indicates with
+its return code whether a recompile is in order.
+
+Adds a B<-expand> flag, which "flattens out" the config spec by
+inlining the contents of any include files.
+
+Add support for a incremental label type families, via a
+I<##:IncrementalLabels:> attribute in the config spec: generate a
+config spec fragment equivalent to the type specified, and include it.
+
+=cut
+
+sub setcs {
+  use strict;
+  use warnings;
+  my %opt;
+  GetOptions(\%opt, qw(clone=s expand needed sync));
+  die Msg('E', "-expand and -sync are mutually exclusive")
+    if $opt{expand} && $opt{sync};
+  die Msg('E', "-expand and -needed are mutually exclusive")
+    if $opt{expand} && $opt{needed};
+  my $tag = ViewTag(@ARGV) if grep /^(expand|sync|needed|clone)$/, keys %opt;
+  if ($opt{expand}) {
+    my $ct = Argv->new([$^X, '-S', $0]);
+    my $settmp = ".$::prog.setcs.$$";
+    open(EXP, ">$settmp") || die Msg('E', "$settmp: $!");
+    print EXP $ct->opts(qw(catcs -expand -tag), $tag)->qx;
+    close(EXP);
+    $ct->opts('setcs', $settmp)->system;
+    unlink $settmp;
+    exit $?;
+  } elsif ($opt{sync} || $opt{needed}) {
+    chomp(my @srcs = qx($^X -S $0 catcs -sources -tag $tag));
+    exit 2 if $?;
+    (my $obj = $srcs[0]) =~ s/config_spec/.compiled_spec/;
+    die Msg('E', "$obj: no such file") if ! -f $obj;
+    die Msg('E', "no permission to update $tag's config spec") if ! -w $obj;
+    my $otime = (stat $obj)[9];
+    my $needed = grep { (stat $_)[9] > $otime } @srcs;
+    if ($opt{sync}) {
+      if ($needed) {
+	ClearCase::Argv->setcs(qw(-current -tag), $tag)->exec;
+      } else {
+	exit 0;
+      }
+    } else {
+      exit $needed;
+    }
+  } elsif ($opt{clone}) {
+    my $ct = ClearCase::Argv->new;
+    my $ctx = $ct->find_cleartool;
+    my $cstmp = ".$ARGV[0].$$.cs.$tag";
+    Argv->autofail(1);
+    Argv->new("$ctx catcs -tag $opt{clone} > $cstmp")->system;
+    $ct->setcs('-tag', $tag, $cstmp)->system;
+    unlink($cstmp);
+    exit 0;
+  }
+  my $setcs = ClearCase::Argv->new(@ARGV);
+  $setcs->parse(qw(default tag=s));
+  exit $setcs->system if $setcs->flag('default');
+  my ($cs) = $setcs->args;
+  my (@cs1, @cs2, $incfam);
+  open my $fh, '<', $cs or die Msg('E', qq(Unable to access "$cs": $!\n));
+  while (<$fh>) {
+    if (/^\#\#:IncrementalLabels: *([^\s]+)/) {
+      $incfam = $1;
+      last;
+    }
+    push @cs1, $_;
+  }
+  @cs2 = <$fh> if $incfam;
+  close $fh;
+  exit $setcs->system unless $incfam;
+  my ($lbtype, $vob) = $incfam =~ /^(?:lbtype:)?(.*?)\@(.*)$/;
+  die Msg('E', qq(Failed to parse the vob from "incfam\n")) unless $vob;
+  my $rmat = 'Rm' . ($lbtype =~ /^(.*)_/ ? $1 : $lbtype);
+  my @eqlst = _EqLbTypeList($lbtype);
+  my $nr = $1 if $eqlst[0] =~ /^.*_(\d+\.\d+)$/;
+  die Msg('E', qq("$lbtype" is not the top of a label type family\n))
+    unless $nr;
+  my $ct = ClearCase::Argv->new({autochomp=>1});
+  $tag = $ct->argv(qw(pwv -s))->qx unless $tag = $setcs->flag('tag');
+  die Msg('E', 'Cannot get view info for current view: not a ClearCase object.')
+    unless $tag;
+  my ($vws) = reverse split '\s+', $ct->argv('lsview', $tag)->qx;
+  open $fh, '>', "$vws/$lbtype"
+    or die Msg('E',
+	       qq(Failed to write config spec fragment "$vws/$lbtype": $!\n));
+  print $fh qq(element * "{lbtype($_)&&!attr_sub($rmat,<=,$nr)}"\n) for @eqlst;
+  close $fh;
+  $cs .= $$;
+  open $fh, '>', $cs or die Msg('E', qq(Could not write "$cs": $!\n));
+  print $fh @cs1;
+  print $fh "include $vws/$lbtype\n";
+  print $fh @cs2;
+  close $fh;
+  my $rc = $setcs->args($cs)->system;
+  unlink $cs;
+  exit $rc;
 }
 
 =back
