@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.26';
+$VERSION = '0.27';
 
 use warnings;
 use strict;
@@ -45,7 +45,7 @@ use AutoLoader 'AUTOLOAD';
 *co             = *checkout;
 *ci		= *checkin;
 *des            = *describe;
-*desc            = *describe;
+*desc           = *describe;
 *lsgen		= *lsgenealogy;
 *unco           = *uncheckout;
 
@@ -90,17 +90,15 @@ sub _Printparents {
     for my $c (@s) {
       $cprinted++ if $$gen{$c}{printed};
     }
-    if ($cprinted) {
+    if ($cprinted or !$ind) {
+      my $plural = @u>1? 's' : '';
       if ($ind == 0) {
-	print "\[offsprings:";
+	print "\[offspring${plural}: ";
       } else {
 	my $pind = $ind - 1;
-	printf("%${pind}s\[siblings:", '');
+	print ' 'x$pind, "\[sibling${plural}: ";
       }
-      foreach (@u) {
-	print " $_";
-      }
-      print "\]\n";
+      print join(' ', @u), "\]\n";
     }
   }
   my $yes = ($opt{all} or (scalar(@p) != 1) or (scalar(@s) != 1)
@@ -160,7 +158,7 @@ sub _Checkcs {
   $ct = $ct->clone();
   $v =~ s/^(.*?)\@\@.*$/$1/;
   my $dest = dirname($v);
-  $dest = '' if $dest eq '.';
+  $dest .= '/' unless $dest =~ m%/$%;
   my $pwd = getcwd();
   $ct->argv('cd', $dest)->system if $dest;
   my @cs = grep /^\#\#:BranchOff: *root/, $ct->argv('catcs')->qx;
@@ -176,16 +174,18 @@ sub _Pbrtype {
   }
   return $pbrt->{$bt};
 }
-sub _Parsevtree($$$) {
+sub _Parsevtree {
   my ($ele, $obs, $sel) = @_;
-  $ct->argv('lsvtree');
+  $ct->lsvtree;
   my @opt = qw(-merge -all);
   push @opt, '-obs' if $obs;
   $ct->opts(@opt);
-  my @vt = grep m%(^$sel|[\\/]([1-9]\d*|CHECKEDOUT))( .*)?$%,
-    $ct->args($ele)->qx;
-  map { s%\\%/%g } @vt;
-  my %gen = ();
+  my @vt = $ct->args($ele)->qx;
+  my $v0 = $vt[1];
+  @vt = grep m%(^$sel|[\\/]([1-9]\d*|CHECKEDOUT))( .*)?$%, @vt;
+  map { s%\\%/%g } @vt, $v0;
+  my (%gen, @root);
+  $gen{$v0}{labels} = $1 if $v0 =~ s%/0 (\(.*)$%/0%;
   my @stack = ();
   foreach my $g (@vt) {
     $g =~ s%^(.*/CHECKEDOUT) view ".*"(.*)$%$1$2%;
@@ -203,8 +203,68 @@ sub _Parsevtree($$$) {
     if (_Findpredinstack($g, \@stack)) {
       push @{ $gen{$g}{parents} }, $stack[-1];
       push @{ $gen{$stack[-1]}{children} }, $g;
+    } elsif ($g ne $v0 and !$gen{$g}{parents}) {
+      push @root, $g; #come back later
     }
     push @stack, $g;
+  }
+  for (@root) {
+    next if $gen{$_}{parents};
+    push @{ $gen{$_}{parents} }, $v0;
+    push @{ $gen{$v0}{children} }, $_;
+  }
+  return %gen;
+}
+sub _DepthGen {
+  use strict;
+  use warnings;
+  my ($ele, $dep, $sel, $verbose) = @_;
+  my %gen;
+  my $parents = sub {
+    my $ver = shift;
+    # v0 is $ele@@/main/0, whatever the actual name of 'main' for $ele
+    # Only mention v0 as last recourse, if there is nothing else
+    my $pred = $ct->des([qw(-fmt %En@@%PVn)], $ver)->qx;
+    return if $pred eq "$ele@@"; # Only v0 has no parent
+    my @ret = grep s/^<- .*?(@.*)/$ele$1/,
+      $ct->des([qw(-s -ahl Merge)], $ver)->qx;
+    $pred = $ct->des([qw(-fmt %En@@%PVn)], $pred)->qx
+      while $pred =~ m%\@[^@]*[/\\][^@]+[/\\][^@]+[/\\]0$%;
+    s%\\%/%g for grep $_, $pred, @ret; # Windows...
+    push @ret, $pred unless $pred =~ m%/0$% and @ret;
+    return @ret
+  };
+  if ($verbose) {
+    my @offsp = grep s/^-> .*?(@.*)/$ele$1/,
+      $ct->des([qw(-s -ahl Merge)], $sel)->qx;
+    my ($br, $nr) = ($sel =~ m%^(.*)/(\d+)$%); # $sel is normalized
+    if ($br and opendir BR, $br) { # Skip for CHECKEDOUT
+      my @f = grep !/^\.\.?/, readdir BR;
+      closedir BR;
+      my @n = sort grep { (/^\d+$/ and $_ > $nr) or $_ eq 'CHECKEDOUT' } @f;
+      push @offsp, join('/', $br, $n[0]) if @n;
+      my $sil = new ClearCase::Argv({autochomp=>1, stdout=>0, stderr=>0});
+      push @offsp, join('/', $br, $_, '0')
+       	for grep { /^\D/ and !$sil->des(['-s'], "brtype:$_")->system } @f;
+      push @{ $gen{$sel}{children} }, @offsp;
+    }
+  }
+  if ($dep) {
+    my @set = ($sel);
+    do {
+      my @nxt;
+      for my $s (@set) {
+	next if defined $gen{$s}{parents};
+	my @p = $parents->($s);
+	@{ $gen{$s}{parents} } = @p;
+	$gen{$s}{labels} = $ct->des([qw(-fmt %l)], $s)->qx;
+	push @{ $gen{$_}{children} }, $s for @p;
+	push @nxt, @p;
+      }
+      @set = @nxt;
+    } while $dep--;
+  } else {
+    $gen{$sel}{labels} = $ct->des([qw(-fmt %l)], $sel)->qx;
   }
   return %gen;
 }
@@ -229,7 +289,7 @@ sub _Mkbco {
   die Msg('E', 'Element pathname required.') unless $cmd->args;
   foreach my $e ($cmd->args) {
     my $ver = $cmd->{ver};
-    my $typ = $ct->argv(qw(des -fmt %m), $e)->qx;
+    my $typ = $ct->des([qw(-fmt %m)], $e)->qx;
     if ($typ !~ /(branch|version)$/) {
       warn Msg('W', "Not a vob object: $e");
       $rc = 1;
@@ -247,7 +307,7 @@ sub _Mkbco {
       $ver .= '/LATEST' if $typ eq 'branch';
     }
     if (!$ver or !$bt) {
-      my $sel = $ct->argv('ls', '-d', $e)->qx;
+      my $sel = $ct->ls(['-d'], $e)->qx;
       if ($bt) {
 	$ver = $1 if $sel =~ /^(.*?) +Rule/;
       } elsif ($sel =~ /^(.*?) +Rule:.*-mkbranch (.*?)\]?$/) {
@@ -255,9 +315,12 @@ sub _Mkbco {
       }
     }
     if ($bt and _Checkcs($e)) {
-      my $main = ($ct->argv('lsvtree', $e)->qx)[0];
-      $main =~ s%^[^@]*\@\@[\\/](.*)$%$1%;
-      my $vob = $ct->argv('des', '-s', "vob:$e")->qx;
+      my $main = 'main';
+      if ($ct->des(['-s'], "$e\@\@/main/0")->stderr(0)->stdout(0)->system) {
+	$main = ($ct->lsvtree($e)->qx)[0];
+	$main =~ s%^[^@]*\@\@[\\/](.*)$%$1%;
+      }
+      my $vob = $ct->des(['-s'], "vob:$e")->qx;
       my $re = _Pbrtype(\%pbrt, "$bt\@$vob") ?
 	qr([\\/]${main}[\\/]$bt[\\/]\d+$) : qr([\\/]$bt[\\/]\d+$);
       if ($ver =~ m%$re%) {
@@ -265,12 +328,11 @@ sub _Mkbco {
 	$rc |= $ct->argv('co', @opts)->system;
       } else {
 	my @mkbcopt = @cmt? @cmt : qw(-nc);
-	if ($ct->argv('mkbranch', @mkbcopt, '-ver', "/$main/0", $bt, $e)
-	      ->stderr(0)->system) {
+	if ($ct->mkbranch([@mkbcopt, '-ver', "/$main/0", $bt], $e)->system) {
 	  $rc = 1;
 	} else {
 	  if ($ver !~ m%\@\@[\\/]${main}[\\/]0$%) {
-	    my $lrc = $ct->argv('merge', '-to', $e, $ver)->stdout(0)->system;
+	    my $lrc = $ct->merge(['-to', $e], $ver)->stdout(0)->system;
 	    unlink glob("$e.contrib*");
 	    $rc |= $lrc;
 	  }
@@ -362,14 +424,10 @@ sub _PreCi {
   my $diff = $ci->clone->prog('diff');
   $ct = $ci->clone;
   $ct->autochomp(1);
-  my $ver = $ct->argv(qw(des -fmt %En@@%Vn), $elem)->qx;
-  $ver =~ s%\\%/%g;
-  my $bra = $1 if $ver =~ m%^(.*?)/(?:\d+|CHECKEDOUT)$%;
-  my %gen = _Parsevtree($elem, 1, $ver);
-  my $p = $gen{$ver}{'parents'};
-  my ($brp) = grep { m%^$bra/\d+$% } @{$p};
+  my $par = $ct->argv(qw(des -fmt %En@@%PVn), $elem)->qx;
+  $par =~ s%\\%/%g;
   $diff->optsDIFF(q(-serial), $diff->optsDIFF);
-  $diff->args($brp? $brp : $p->[0], $elem);
+  $diff->args($par, $elem);
   # Without -diff we only care about return code
   $diff->stdout(0) unless $opt->{diff};
   # With -revert, suppress msgs from typemgrs that don't do diffs
@@ -389,7 +447,7 @@ sub _PreCi {
 }
 sub _Preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
   use File::Temp qw(tempfile);
-  my ($cmd, $fn, $tst) = @_; #parsed, 3 groups: cquery|cqeach nc c|cfile=s
+  my ($cmd, $fn, $tst, $tnc) = @_; #parsed, 3 groups: cquery|cqeach nc c|cfile=s
   use warnings;
   use strict;
   my @opts = $cmd->opts;
@@ -433,6 +491,14 @@ sub _Preemptcmt { #return the comments apart: e.g. mklbtype needs discrimination
   if ($ncf or $cf) {
     if ($ncf) {
       $cmd->opts(grep !/^-nc(?:omment)?$/,@opts);
+      if ($tst and $tnc) {
+	my (@args1, @args) = $cmd->args;
+	for (@args1) {
+	  push @args, $_ if $tst->($cmd, $_);
+	}
+	exit 0 unless @args;
+	$cmd->args(@args);
+      }
       $ret = $fn->($cmd, qw(-nc));
     } else {
       my $skip = 0;
@@ -496,7 +562,7 @@ sub _Unco {
   for my $arg ($unco->args) { # Already sorted if several
     my $b0 = $ct->argv(qw(ls -s -d), $arg)->qx;
     $rc |= $unco->args($arg)->system;
-    if ($b0 =~ s%^(.*)[\\/]CHECKEDOUT$%$1%) {
+    if ($b0 =~ s%^(.*)[\\/]CHECKEDOUT$%$1% and $b0 !~ m%@@/[^/]+$%) {
       opendir BR, $b0 or next;
       my @f = grep !/^\.\.?$/, readdir BR;
       closedir BR;
@@ -649,6 +715,10 @@ Show 'uninteresting' versions, otherwise skipped:
 
 =back
 
+Note that a different algorithm is used with and without the C<-all> option.
+The latter uses C<lsvtree> and may thus be slow on elements with a large
+version tree. The former is thus more scalable.
+
 =item B<-obsolete>
 
 Add obsoleted branches to the search.
@@ -676,18 +746,19 @@ sub lsgenealogy {
     $_ = readlink if -l && defined readlink;
     push @argv, MSWIN ? glob($_) : $_;
   }
-  $ct = ClearCase::Argv->new({autofail=>0,autochomp=>1,stderr=>0});
-  $ct->ipc(1) unless $ct->ctcmd(1);
+  $ct = ClearCase::Argv->new({autofail=>0, autochomp=>1, stderr=>0});
   while (my $e = shift @argv) {
-    my ($ele, $ver, $type) =
-      $ct->argv(qw(des -fmt), '%En\n%En@@%Vn\n%m', $e)->qx;
+    my ($ver, $type) =
+      $ct->des([qw(-fmt %En@@%Vn\n%m)], $e)->qx;
     if (!defined($type) or ($type !~ /version$/)) {
       warn Msg('W', "Not a version: $e");
       next;
     }
-    $ele =~ s%\\%/%g;
     $ver =~ s%\\%/%g;
-    my %gen = _Parsevtree($ele, $opt{obsolete}, $ver);
+    my $ele = $ver;
+    $ele =~ s%^(.*?)\@.*%$1%; # normalize in case of vob root directory
+    my %gen = $opt{all}? _DepthGen($ele, $opt{depth}, $ver, !$opt{short})
+      : _Parsevtree($ele, $opt{obsolete}, $ver);
     _Setdepths($ver, 0, \%gen);
     my %seen = ();
     _Printparents($ver, \%gen, \%seen, 0);
@@ -859,7 +930,7 @@ sub diff {
     $ele =~ s%\\%/%g;
     $ver =~ s%\\%/%g;
     my $bra = $1 if $ver =~ m%^(.*?)/(?:\d+|CHECKEDOUT)$%;
-    my %gen = _Parsevtree($ele, 1, $ver);
+    my %gen = _DepthGen($ele, $limit + 1, $ver);
     my $p = $gen{$ver}{'parents'};
     $p = $gen{$p->[0]}{'parents'} while $p and $limit--;
     if (!$p) {
@@ -867,7 +938,7 @@ sub diff {
       $rc = 1;
       next;
     }
-    my ($brp) = grep { m%^$bra/\d+$% } @{$p};
+    my ($brp) = grep { m%^\Q$bra\E/\d+$% } @{$p};
     $ver = $ele if $ver =~ m%/CHECKEDOUT$%;
     $rc |= $diff->args($brp? $brp : $p->[0], $ver)->system;
   }
@@ -1019,11 +1090,6 @@ sub _GenMkTypeSub {
     my @args = $ntype->args;
     my %opt = %{$ntype->{fopts}};
     my $silent = $ct->clone({stdout=>0});
-    if ((grep /^-glo/, $ntype->opts) or ($ntype->flag('global') and !%opt)) {
-      push @cmt, '-rep' if $rep;
-      $ntype->opts(@cmt, $ntype->opts);
-      return $ntype->system
-    }
     my (%vob, $unkvob);
     /\@(.*)$/? $vob{$1}++ : $vob{'.'}++ for @args;
     my @vob = keys %vob;
@@ -1049,15 +1115,34 @@ sub _GenMkTypeSub {
 	warn Msg('W', "making global type(s) @args");
       }
     }
+    my %targ; #target vobs per type, for use with -inc and -arc
     if (%opt) {
-      map { s/^${type}:(.*)$/$1/ } @args;
-      my @a = @args;
+      map { s/^$type://; $_ } @args;
+      if (!$opt{family} and !$ntype->flag('global')) { #before ensuring types
+	my @glb = grep /^global/,
+	  map{$ct->des([qw(-fmt %[type_scope]p)], "$type:$_")->qx} @args;
+	die Msg('E', "Cannot process a mixture of global and ordinary types\n")
+	  if @glb and scalar @glb != scalar @args;
+	if (@glb) {
+	  $ntype->opts('-global', $ntype->opts);
+	  my @a = @args;
+	  map {($_) = grep s/^$type://,
+		 $ct->des([qw(-fmt %Xn)], "$type:$_")->qx} @args;
+	  my $cvob = $ct->des(['-s'], 'vob:.')->qx;
+	  for (@args) {
+	    my $mvob = $1 if /\@(.*)$/;
+	    my $lvob = (shift(@a) =~ /\@(.*)$/)? $1: $cvob;
+	    $targ{$_} = $lvob unless $lvob eq $mvob;
+	  }
+	  @vob = (); #The types were already created
+	}
+      }
       _Ensuretypes((grep /^-glo/, $ntype->opts), @vob);
       if ($rep) {
 	@args = grep { $_ = $ct->des([qw(-fmt %Xn)], "$type:$_")->qx } @args;
 	exit 1 unless @args;
 	if ($opt{family}) {
-	  @a = ();
+	  my @a = ();
 	  my $gflg = (grep /^-glo/, $ntype->opts)? '-glo' : '-ord';
 	  foreach my $t (@args) {
 	    if ($ct->des([qw(-s -ahl), $eqhl], $t)->stderr(0)->qx) {
@@ -1093,6 +1178,7 @@ sub _GenMkTypeSub {
 	  } keys %pair;
 	} elsif ($opt{archive}) {
 	  my $rc = 0;
+	  $ntype->opts('-nc', $ntype->opts);
 	  foreach my $t (@args) {
 	    my ($pfx, $vob) = $t =~ /^$type:(.*?)(@.*)$/;
 	    my ($prev) = grep s/^-> $type:(.*?)@.*/$1/,
@@ -1116,8 +1202,12 @@ sub _GenMkTypeSub {
 	      next;
 	    }
 	    $ntype->args($t);
-	    $ntype->opts('-nc', $ntype->opts);
 	    $ntype->system;
+	    if (my $v = $targ{(split /:/, $t)[1]}) {
+	      my $t2 = "${1}$v" if $t =~ /^(.*?\@)/;
+	      $silent->cptype($t, $t2)->system;
+	      $silent->mkhlink(['GlobalDefinition'], $t2, $t)->system;
+	    }
 	    my $at = "$type:${arc}$vob";
 	    $silent->mkhlink([$prhl], $t, $at)->system;
 	    if ($type eq 'lbtype') {
@@ -1131,7 +1221,7 @@ sub _GenMkTypeSub {
 	      push @arg, $eq if $eq;
 	      $ct->lock(@arg)->system;
 	    }
-	    $ct->argv('chevent', @cmt, $at)->stdout(0)->system
+	    $ct->chevent([@cmt], $at)->stdout(0)->system
 	      unless $cmt[0] and $cmt[0] =~ /^-nc/;
 	  }
 	  exit $rc;
@@ -1140,7 +1230,7 @@ sub _GenMkTypeSub {
 	}
       } else {
 	if ($opt{family}) {
-	  @a = @args;
+	  my @a = @args;
 	  map { $_ = "$type:$_" } @a;
 	  die Msg('E', "Some types already exist among @args")
 	    unless $silent->argv(qw(des -s), @a)->stderr(0)->system;
@@ -1205,12 +1295,12 @@ sub _GenMkTypeSub {
 	  my ($fl, $loaded) = $ENV{FORCELOCK};
 	INCT: for my $t (@args) {
 	    my ($pt, $lck) = "$type:$t";
-	    if (!$ct->argv(qw(des -s), $pt)->stderr(0)->qx) {
+	    if (!$ct->des(['-s'], $pt)->stderr(0)->qx) {
 	      warn Msg('E', qq($Name type not found: "$t"));
 	      next;
 	    }
 	    my ($pair) = grep s/^\s*(.*) -> $type:(.*)\@(.*)$/$1,$2,$3/,
-	      $ct->argv(qw(des -l -ahl), $eqhl, $pt)->stderr(0)->qx;
+	      $ct->des([qw(-l -ahl), $eqhl], $pt)->stderr(0)->qx;
 	    my ($hlk, $prev, $vob) = split /,/, $pair if $pair;
 	    if (!$prev) {
 	      warn Msg('E', "Not a family type: $t");
@@ -1218,11 +1308,11 @@ sub _GenMkTypeSub {
 	    }
 	    my ($t1) = $t =~ /^(.*?)(@|$)/;
 	    for my $l ($t1, $prev) {
-	      if ($ct->argv(qw(lslock -s), "lbtype:$l\@$vob")->stderr(0)->qx) {
+	      if ($ct->lslock(['-s'], "lbtype:$l\@$vob")->stderr(0)->qx) {
 		$lck = 1;  #remember to lock the equivalent fixed type
 		#This should happen as vob owner, to retain the timestamp
 		my @out =
-		  $lct->argv('unlock', "lbtype:$l\@$vob")->stderr(1)->qx;
+		  $lct->unlock("lbtype:$l\@$vob")->stderr(1)->qx;
 		if (grep /^cleartool: Error/, @out) {
 		  if ($fl and !$loaded) {
 		    my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
@@ -1249,16 +1339,22 @@ sub _GenMkTypeSub {
 		$new = "${base}_" .
 		  (defined($min)? $maj . '.' . ++$min : ++$maj);
 		$new .= $ext;
-	      } while ($ct->argv(qw(des -s), "$type:$new")->stderr(0)->qx);
+	      } while $ct->des(['-s'], "$type:$new")->stderr(0)->qx;
 	      $ntype->args($new)->system and exit 1;
-	      $silent->argv('rmhlink', $hlk)->system;
-	      $silent->argv(qw(mkhlink -nc), $eqhl,
-			    "$type:$t", "$type:$new")->system;
-	      $silent->argv(qw(mkhlink -nc), $prhl,
-			    "$type:$new", "$type:$p1")->system;
+	      $silent->rmhlink($hlk)->system;
+	      $silent->mkhlink(['-nc', $eqhl,
+			    "$type:$t"], "$type:$new")->system;
+	      $silent->mkhlink(['-nc', $prhl,
+			    "$type:$new"], "$type:$p1")->system;
+	      if (my $v = $targ{$t}) {
+		my $t1 = "$type:$new";
+		my $t2 = "$type:${1}$v" if $new =~ /^(.*?\@)/;
+		$silent->cptype($t1, $t2)->system;
+		$silent->mkhlink(['GlobalDefinition'], $t2, $t1)->system;
+	      }
 	      if ($lck) {
 		my @out =
-		  $lct->argv('lock', "lbtype:$prev\@$vob")->stderr(1)->qx;
+		  $lct->lock("lbtype:$prev\@$vob")->stderr(1)->qx;
 		if ($fl and grep /^cleartool: Error/, @out) {
 		  flocklt($prev, $vob); # loaded while unlocking
 		} else {
@@ -1272,16 +1368,25 @@ sub _GenMkTypeSub {
 	}
       }
       exit 0;
-    } else {			# non inc/arc/fam
+    } else {			# no inc/arc/fam option
       if ($rep) {
 	$ntype->opts(@cmt, '-replace', $ntype->opts);
 	map { $_ = "$type:$_" unless /^$type:/ } @args;
-	my @a = $ct->argv(qw(des -s), @args)->stderr(0)->qx;
+	my @a = $ct->argv(qw(des -fmt %Xn), @args)->stderr(0)->qx;
 	if (@a) {
-	  map { $_ = "$type:$_" } @a;
-	  my @link = grep s/^\s*(.*) -> .*$/$1/,
-	    $ct->argv(qw(des -l -ahl), "$eqhl,$prhl", @a)->qx;
-	  $ct->argv('rmhlink', @link)->system;
+	  my @link;
+	  if ($ntype->flag('global')) { # replace also the equivalent types
+	    my @eq = grep s/^-> (.*)$/$1/,
+	      $ct->argv(qw(des -s -ahl), $eqhl, @a)->qx;
+	    push @args, @eq;
+	    $ntype->args(@args);
+	  } else { # remove the hyperlinks, i.e. make the types 'non-family'
+	    @link = grep s/^\s*(.*) -> .*$/$1/,
+	      $ct->argv(qw(des -l -ahl), "$eqhl,$prhl", @a)->qx;
+	  }
+	  my $ret = $ntype->system; # may fail because of restrictions: first
+	  $ret = $ct->argv('rmhlink', @link)->system if @link and !$ret;
+	  return $ret;
 	} else {
 	  foreach (@args) {
 	    s/^$type://;
@@ -1316,7 +1421,6 @@ sub mklbtype {
   GetOptions('replace' => \$rep);
   die Msg('E', 'Incompatible options: family increment archive')
     if keys %opt > 1;
-  ClearCase::Argv->ipc(1);
   my $ntype = ClearCase::Argv->new(@ARGV);
   $ntype->parse(qw(global|ordinary vpelement|vpbranch|vpversion
 		   pbranch|shared gt|ge|lt|le|enum|default|vtype=s
@@ -1827,16 +1931,19 @@ sub checkin {
   for (@elems) {
     die Msg('E', "$_: appears to be open in vim!") if -f ".$_.swp";
   }
-  if ($opt{diff} or $opt{revert}) {
+  if ($opt{diff}) {
+    warn Msg('W', 'Ignoring c/nc flags when diff set')
+      if grep /^-c|-nc$/, $ci->opts;
     # In case ~/.clearcase_profile makes ci -nc the default, make sure
     # we prompt for a comment - unless checking in dirs only.
-    if (!grep(/^-c|^-nc$/, $ci->opts) && grep(-f, @elems)) {
-      $ci->opts('-cqe', $ci->opts);
+    if (grep(-f, @elems)) {
+      $ci->opts('-cqe', grep(!/^-c|^-nc$/, $ci->opts));
       $ci->{AV_LKG}{''}{cquery}=1;
+      delete @{$ci->{AV_LKG}{''}}{qw(c nc)};
     }
   }
   $ci->{opthashre} = \%opt;
-  _Preemptcmt($ci, \&_Checkin, \&_PreCi);
+  _Preemptcmt($ci, \&_Checkin, \&_PreCi, $opt{revert});
 }
 
 =item * RMBRANCH
@@ -2038,7 +2145,7 @@ sub rmtype {
       } else {
 	my ($prev) = grep s/^-> (lbtype:.*)/$1/,
 	  $ct->argv(qw(des -s -ahl), $prhl, $eq)->qx;
-	if ($ct->argv(qw(lslock -s), $prev)->stderr(0)->qx) {
+	if ($prev and $ct->argv(qw(lslock -s), $prev)->stderr(0)->qx) {
 	  push @lck, $prev;
 	  my @out = $lct->argv('unlock', $prev)->stderr(1)->qx;
 	  if (grep /^cleartool: Error/, @out) {
@@ -2082,10 +2189,12 @@ sub rmtype {
 	    $rs = 1;
 	  }
 	} else {
-	  my $t0 = "lbtype:${base}_0$vob"; # store the last eq into hidden type
-	  $ct->argv(qw(mklbtype -nc), $t0)->stdout(0)->system;
-	  $ct->argv(qw(mkhlink), $eqhl, $t0, $prev)->stdout(0)->system;
-	  $ct->argv('lock', $t0)->stdout(0)->system;
+	  if ($prev) {
+	    my $t0 = "lbtype:${base}_0$vob"; # store the last eq into hidden type
+	    $ct->argv(qw(mklbtype -nc), $t0)->stdout(0)->system;
+	    $ct->argv(qw(mkhlink), $eqhl, $t0, $prev)->stdout(0)->system;
+	    $ct->argv('lock', $t0)->stdout(0)->system;
+	  }
 	  push @eq, $eq;
 	}
       }
@@ -2103,6 +2212,60 @@ sub rmtype {
     }
   }
   exit $rs;
+}
+
+=item * CPTYPE
+
+For family types: copy both the "family" (floating) type and its equivalent fixed
+incremental type (and all the hierarchy?).
+
+For global types, create the hyperlinks.
+
+=cut
+
+sub _CpType {
+  use strict;
+  use warnings;
+  my ($cpt, @cmt) = @_;
+  $ct = new ClearCase::Argv({autochomp=>1});
+  my ($src, $dst) = $cpt->args;
+  my $glb = $ct->des([qw(-fmt %[type_scope]p)], $src)->qx;
+  $glb = 0 if $glb and $glb eq 'ordinary';
+  my ($eqt) = grep s/^->\s+(.*)$/$1/, $ct->des([qw(-s -ahl), $eqhl], $src)->qx;
+  my $ret = $cpt->system;
+  return $ret if $ret or !($glb or $eqt);
+  if ($eqt) {
+    my ($deq) = ($eqt =~ /^(.*?)\@/);
+    my ($dvb) = ($dst =~ /^.*?(\@.*)$/);
+    $deq .= $dvb;
+    $ret = $cpt->args($eqt, $deq)->system;
+    if (!$ret) {
+      if ($glb) {
+	$ret = $ct->mkhlink(['GlobalDefinition'], $deq, $eqt)->system;
+      } else {
+	$ret = $ct->mkhlink([$eqhl], $dst, $deq)->system;
+      }
+    }
+  }
+  if ($dst !~ /:/) {
+    $dst = "$1$dst" if $src =~ /^(.*?:)/;
+  }
+  $ret += $ct->mkhlink(['GlobalDefinition'], $dst, $src)->system if $glb;
+  return $ret;
+}
+sub cptype {
+  use strict;
+  use warnings;
+  my $cpt = ClearCase::Argv->new(@ARGV);
+  $cpt->parse(qw(c|cfile cq|cqe nc replace));
+  if (scalar $cpt->args != 2) {
+    warn Msg('E', 'Type name required.');
+    @ARGV = qw(help cptype);
+    ClearCase::Wrapper->help();
+    return 1;
+  }
+  return 1 if ClearCase::Argv->des(['-s'], ($cpt->args)[0])->stdout(0)->system;
+  _Preemptcmt($cpt, \&_CpType);
 }
 
 =item * SETCS
@@ -2275,16 +2438,16 @@ sub describe {
     my @nargs;
     for my $arg (@args) {
       my $i = $generations;
-      my ($ele, $ver, $type) =
-	$ct->des([qw(-fmt %En\n%En@@%Vn\n%m)], $arg)->qx;
+      my ($ver, $type) =
+	$ct->des([qw(-fmt %En@@%Vn\n%m)], $arg)->qx;
       if (!defined($type) or ($type !~ /version$/)) {
 	warn Msg('W', "Not a version: $arg");
 	next;
       }
-      $ele =~ s%\\%/%g;
       $ver =~ s%\\%/%g;
-      my $bra = $1 if $ver =~ m%^(.*?)/(?:\d+|CHECKEDOUT)$%;
-      my %gen = _Parsevtree($ele, 1, $ver);
+      my $ele = $ver;
+      $ele =~ s%^(.*?)\@.*%$1%; # normalize in case of vob root directory
+      my %gen = _DepthGen($ele, $i, $ver);
       my @p = @{$gen{$ver}{'parents'}};
       while (@p and --$i) {
 	my %q;
@@ -2372,22 +2535,42 @@ sub mkview {
   my @k = grep !/(stgloc|host|hpath|gpath|tmode|shareable_dos)/,
     keys %{$mkv->{AV_LKG}{'CC'}};
   my @opts = (map(("-$_", $mkv->flagCC($_)), @k), '-tmo', $tmo, "-$shdo");
-  my ($host, $ogpa, $hpa) = ($2, $1, $3) if $lsv =~
-    /Global path: (.*?)\n.*Server host: (.*?)\n.*access path: (.*?)\n/s;
+  my ($host, $ogpa, $hpa, $own) = ($2, $1, $3, $4)
+    if $lsv =~ m{ \QGlobal path: \E(.*?)\n.*
+		  \QServer host: \E(.*?)\n.*
+		  \Qaccess path: \E(.*?)\n.*
+		  \QView owner: \E(?:.*?/)(.*?)\n
+	      }xs;
   if ($mkv->flagCC('stgloc')) {
     push @opts, '-stg', $mkv->flagCC('stgloc');
   } else {
-    $hpa = $mkv->flagCC('hpath')?
-      $mkv->flagCC('hpath') : File::Spec->catdir(dirname($hpa), "$tag.vws");
-    my $gpa = $mkv->flagCC('gpath')?
-      $mkv->flagCC('gpath') : File::Spec->catdir(dirname($ogpa), "$tag.vws");
+    my $pwnam = (getpwuid($<))[0];
+    if ($mkv->flagCC('hpath')) {
+      $hpa = $mkv->flagCC('hpath');
+    } else {
+      my $pdir = dirname($hpa);
+      if (basename($pdir) eq $own) {
+	$hpa = File::Spec->catdir(dirname($pdir), $pwnam, "$tag.vws");
+      } else {
+	$hpa = File::Spec->catdir($pdir, "$tag.vws");
+      }
+    }
+    my $gpa = $mkv->flagCC('gpath');
+    if (!$gpa) {
+      my $pdir = dirname($ogpa);
+      if (basename($pdir) eq $own) {
+	$gpa = File::Spec->catdir(dirname($pdir), $pwnam, "$tag.vws");
+      } else {
+	$gpa = File::Spec->catdir($pdir, "$tag.vws");
+      }
+    }
     $host = $mkv->flagCC('host') if $mkv->flagCC('host');
     push @opts, '-host', $host, '-hpa', $hpa, '-gpa', $gpa;
     if (!$mkv->args) {
-      if ($host eq hostname or $gpa =~m%^//%) { #UNC gives 'Access is denied'
+      if ($host eq hostname or $gpa =~ m%^//%) { #UNC gives 'Access is denied'
 	$mkv->args($hpa);
       } else {
-	$mkv->args($gpa); #Should work from anywhere
+	$mkv->args($gpa);	#Should work from anywhere
       }
     }
   }
