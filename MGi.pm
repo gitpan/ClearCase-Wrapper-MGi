@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.28';
+$VERSION = '0.29';
 
 use warnings;
 use strict;
@@ -51,13 +51,14 @@ use AutoLoader 'AUTOLOAD';
     "$z [-short] [-all] [-obsolete] [-depth gen-depth] pname ...";
   $mkbrtype = "\n* [-archive]";
   $mklabel = "\n* [-up] [-force] [-over type [-all]]";
-  $mklbtype = "\n* [-family] [-increment] [-archive]";
+  $mklbtype = "\n* [-family] [-increment] [-archive] [-config cr]";
   $rmtype = "\n* [-family] [-increment]";
   $setcs = "\n* [-clone view-tag] [-expand] [-sync|-needed]";
   $mkview = "\n* [-clone view-tag [-equiv lbtype,timestamp]]";
   $describe = "\n* [-par/ents <n>] [-fam/ily <n>]";
   $rollout = "$z [-force] [-c comment] -to baseline brype|lbtype";
   $rollback = "$z [-force] [-c comment] changeset";
+  $archive = "$z [-c comment|-nc] brtype|lbtype ...";
 }
 
 #############################################################################
@@ -692,6 +693,59 @@ sub _FltType {
   $eq =~ s/^lbtype:(.*)\@.*$/$1/;
   return $eq;
 }
+# Record the elements on the path to the argument, from 'mklabel -up'
+# Issues: symbolic links, esp. cross-vob, relative or absolute, view extended
+# path on UNIX or drive context on Windows/Cygwin; using -follow at entry
+sub _Recpath {
+  use File::Basename;
+  use File::Spec::Functions qw(rel2abs catfile);
+  my ($anc, $follow, $n, $stop) = @_;
+  my $type = $ct->des([qw(-fmt %m)], $n)->qx;
+  if ($type eq 'symbolic link') {
+    if ($follow) {
+      my $path = $ct->des([qw(-fmt %[slink_text]p)], $n)->qx;
+      $path =~ y%\\%/% if MSWIN;
+      if ($path =~ m%^/%) {
+	if (MSWIN or CYGWIN) {
+	  my $tag = $ct->des(['-s'], "vob:$n")->qx;
+	  my $pfx = $1 if $n =~ m%^(.*?\Q$tag\E)%;
+	  $path = catfile($pfx, $path);
+	}
+      } else {
+	my $p = dirname($n);
+	while ($path =~ /^\./) {
+	  $path =~ s%^\./(.*)$%$1%;
+	  $p = dirname($p) if $path =~ s%^\.\./(.*)$%$1%;
+	  if ($path eq '.') {
+	    $path = ''; last
+	  }
+	  if ($path eq '..') {
+	    $path = ''; $p = dirname($p); last;
+	  }
+	  last if $path =~ m%^\.[^/]%;
+	}
+	$path = $path? catfile($p, $path) : $p;
+      }
+      if (!$stop) {
+	my $tag = $ct->des(['-s'], "vob:$path")->qx;
+	$stop = length($1) if $path =~ m%^(.*?\Q$tag\E)%;
+      }
+      _Recpath($anc, 1, $path, $stop);
+      $stop = 0;
+    }
+  } elsif ($type !~ /version$/) {
+    return; # Non reachable or dangling
+  }
+  my $pn = rel2abs($n); # if 'a/' with 'a' a symlink, yields 'a', but vob remote
+  if (!$stop) {
+    my $tag = $ct->des(['-s'], "vob:$n")->qx;
+    $stop = length($1) if $pn =~ m%^(.*?\Q$tag\E)%;
+  }
+  my $dad = dirname($pn);
+  return if length($dad) < $stop;
+  $anc->{$dad}++;
+  _Recpath($anc, 1, $dad, $stop);
+}
 
 =head1 NAME
 
@@ -956,7 +1010,7 @@ sub diff {
     my %gen = _DepthGen($ele, $limit + 1, $ver);
     my $p = $gen{$ver}{'parents'};
     $p = $gen{$p->[0]}{'parents'} while $p and $limit--;
-    if (!$p) {
+    if (!($p and @{$p})) {
       warn Msg('E', "No predecessor version to compare to: $e");
       $rc = 1;
       next;
@@ -1111,6 +1165,15 @@ is given for the same name.
 
 Support for global family types is preliminary.
 
+=item B<-con/fig>
+
+Make or increment lbtypes in all vobs used by a config record.
+
+=item B<-exc/lude>
+
+When using a config record, exclude comma separated vobs for label
+type creation.
+
 =back
 
 =cut
@@ -1129,6 +1192,30 @@ sub _GenMkTypeSub {
     my (%vob, $unkvob);
     /\@(.*)$/? $vob{$1}++ : $vob{'.'}++ for @args;
     my @vob = keys %vob;
+    if ($opt{config}) {
+      die Msg('E', 'Only one lbtype per config record') if @args > 1;
+      die Msg('E', 'Incompatible flags: "-config" and "-archive"')
+	if $opt{archive};
+      die Msg('E', 'Incompatible flags: "-config" and "-replace"') if $rep;
+      my $cr = $opt{config};
+      my $fail = $ct->clone({autofail=>1});
+      my $mvob = $fail->des(['-s'], "vob:$cr")->qx;
+      die Msg('E', qq(Vob specification in lbtype not allowed with "-config"))
+	if $args[0] =~ /\@.*$/;
+      my %vbs;
+      my @dir = $ct->catcr([qw(-flat -s -type d -nxn)], $cr)->qx;
+      die "\n" if grep /^</, @dir; #one vob not mounted
+      $vbs{$ct->des(['-s'], "vob:$_")->stderr(0)->qx}++ for @dir;
+      delete $vbs{$mvob};
+      if ($opt{exclude}) {
+	for (split /,/, $opt{exclude}) {
+	  die Msg('E', 'Cannot exclude the vob of the cr') if $_ eq $mvob;
+	  delete $vbs{$_};
+	}
+      }
+      $vob[0] = $mvob if $vob[0] eq '.'; #override the current vob as default
+      push @vob, keys %vbs;
+    }
     for (@vob) { #Diagnose all the errors, even if one is enough to fail
       $unkvob++ if $silent->argv(qw(des -s), "vob:$_")->system;
     }
@@ -1154,25 +1241,35 @@ sub _GenMkTypeSub {
     if (%opt) {
       map { s/^$type://; $_ } @args;
       if ($opt{increment}) { # lbtypes only
-	my @new = grep {$silent->des(['-s'], "lbtype:$_")->stderr(0)->system}
-	  @args;
+	my @t = @args;
+	if ($opt{config}) {
+	  @t = ();
+	  my $lt = (split /\@/, $args[0])[0];
+	  push @t, "${lt}\@$_" for @vob;
+	  $args[0] = $t[0]; # Only one arg if config, maybe not in current vob
+	}
+	my @new = grep{$silent->des(['-s'], "lbtype:$_")->stderr(0)->system} @t;
 	if (@new) {
 	  {no warnings qw(uninitialized); map{s/^(.*?)(\@.*)?$/${1}_0$2/} @new}
 	  my @arc = grep {$ct->des(['-s'], "lbtype:$_")->stderr(0)->qx} @new;
-	  die Msg('E', "Cannot process a mix of active and archived types\n")
-	    if @arc and scalar @arc != scalar @args;
+	  die Msg('E', 'Cannot process a mix of active and archived types')
+	    if @arc and scalar @arc != scalar @t;
 	  if (@arc) {
 	    undef $opt{increment};
 	    $opt{family} = 1;
+	  } elsif (@new == @t) {
+	    die Msg('E', 'Use -fam to create the family types');
 	  } else {
-	    die Msg('E', "Use -fam to create the family types\n");
+	    $args[0] =~ s/\@.*$//;
+	    my $vobs = join ', ', grep s/^.*\@//, @new;
+	    die Msg('E', "No '$args[0]' in $vobs. Forgot an '-exc' option?");
 	  }
 	}
       }
-      if (!$opt{family} and !$ntype->flag('global')) { #before ensuring types
+      if (!$opt{family} and !$opt{config} and !$ntype->flag('global')) {
 	my @glb = grep /^global/,
 	  map{$ct->des([qw(-fmt %[type_scope]p)], "$type:$_")->qx} @args;
-	die Msg('E', "Cannot process a mix of global and ordinary types\n")
+	die Msg('E', 'Cannot process a mix of global and ordinary types')
 	  if @glb and scalar @glb != scalar @args;
 	if (@glb) {
 	  $ntype->opts('-global', $ntype->opts);
@@ -1188,7 +1285,7 @@ sub _GenMkTypeSub {
 	  my $gflg = (grep /^-glo/, $ntype->opts)? '-glo' : '-ord';
 	  foreach my $t (@args) {
 	    if ($ct->des([qw(-s -ahl), $eqhl], $t)->stderr(0)->qx) {
-	      warn Msg('E', "$t is already a family type\n");
+	      warn Msg('E', "$t is already a family type");
 	      if ($t =~ s/^lbtype:(.*)$/$1/) {
 		my $att = "Rm$t";
 		$ct->mkattype([qw(-vtype real -c), q(Deleted in increment),
@@ -1285,18 +1382,45 @@ sub _GenMkTypeSub {
 	    unless $silent->argv(qw(des -s), @a)->stderr(0)->system;
 	  my @opts = $ntype->opts();
 	  my (%pair, @skip, %glo) = ();
+	  if ($opt{config}) {
+	    $args[0] .= '@' . shift @vob;
+	    push @opts, '-glo' unless grep(/^-glo/, @opts);
+	  }
 	TYPE: foreach my $t (@args) {
 	    if ($t =~ /^(.*?)(@.*)?$/) {
 	      my ($pfx, $sfx) = ($1, $2?$2:'');
 	      if ($type eq 'lbtype') {
 		my $t0 = "lbtype:${pfx}_0$sfx";
 		if ($ct->argv(qw(des -s), $t0)->stderr(0)->qx) {
-		  $glo{$t} = 1 if !grep(/^-glo/, @opts) and
+		  my $g0 =
 		    $ct->des([qw(-fmt %[type_scope]p)], $t0)->qx eq 'global';
+		  # test before unlocking, and record the vobs where linked
+		  if ($opt{config} and $g0) {
+		    $g0 = [$ct->des([qw(-s -ahl GlobalDefinition)], $t0)->qx];
+		    die Msg('E', qq("$t" conflicts with an archived type))
+		      if grep m%/\Q$vob[0]\E$%, @{$g0};
+		  }
 		  $ct->argv('unlock', $t0)->system;
-		  $ct->argv('rename', $t0, "lbtype:$t")->stderr(0)->system
+		  my $lbt = "lbtype:$t";
+		  $ct->argv('rename', $t0, $lbt)->stderr(0)->system
 		    and die Msg('E', qq(Failed to restore "$t0" into "$t".));
+		  if ($opt{config}) {
+		    my %already;
+		    if ($g0) {
+		      $already{$_}++ for grep {s%^.*\@(.*)$%$1%} @{$g0};
+		    } else {
+		      $ct->mklbtype([qw(-rep -glo)], $lbt)->system
+		    }
+		    # Fix the copies, because we'll skip the type creation
+		    for my $v (@vob[1..$#vob]) {
+		      next if $already{$v};
+		      my $cpy =  (split /\@/, $lbt)[0] . "\@$v";
+		      $silent->cptype($lbt, $cpy)->system;
+		      $silent->mkhlink(['GlobalDefinition'], $cpy, $lbt)->system;
+		    }
+		  }
 		  push @skip, $t;
+		  $glo{$t} = 1 if $g0 and !grep(/^-glo/, @opts);
 		  if (my ($p) = grep s/^-> (.*)$/$1/,
 		      $ct->des([qw(-s -ahl), $prhl], "lbtype:$t")->qx) {
 		    ($pair{$t}) = grep s/^-> lbtype:(.*)$/$1/,
@@ -1313,7 +1437,7 @@ sub _GenMkTypeSub {
 	    }
 	  }
 	  if (@skip) {
-	    my $sk = '(' . join('|', @skip) . ')';
+	    my $sk = '^(?:' . join('|', @skip) . ')$'; #Should use \Q...\E
 	    @a = grep !/$sk/, @args;
 	  } else {
 	    @a = @args;
@@ -1336,28 +1460,44 @@ sub _GenMkTypeSub {
 	      my $tt = $ct->des([qw(-fmt %Xn)], "$type:$t")->qx;
 	      $silent->argv('mkhlink', $eqhl, $tt, $inc)->system;
 	      next if $type eq 'brtype';
-	      if ($glo{$t}) {
-		for my $v (grep {s/^<- lbtype:.*?\@(.*)$/$1/}
-		  $ct->des([qw(-s -ahl GlobalDefinition)], $tt)->qx) {
+	      if ($glo{$t}) { # If restored type, otherwise handle all later
+		my @tvob = grep {s/^<- lbtype:.*?\@(.*)$/$1/}
+		    $ct->des([qw(-s -ahl GlobalDefinition)], $tt)->qx;
+		for my $v (@tvob) {
 		  my ($cpy) = ($inc =~ /^(.*?\@)/);
 		  $cpy .= $v;
-		  $silent->cptype($inc, $cpy)->system;
-		  $silent->mkhlink(['GlobalDefinition'], $cpy, $inc)->system;
+		  _wrap('cptype', $inc, $cpy);
 		}
 	      }
 	      unshift @o, q(Deleted in increment);
 	      $ct->mkattype([qw(-vty real -c), @o], "Rm$t")->stderr(0)->system;
+	    }
+	    if ($opt{config} and @vob) {
+	      for my $a (@a) { # restored types are skipped from these
+		my $src = "lbtype:$a";
+		for my $v (@vob) {
+		  my $cpy =  (split /\@/, $src)[0] . "\@$v";
+		  _wrap('cptype', $src, $cpy);
+		}
+	      }
 	    }
 	  }
 	} elsif ($opt{increment}) { # increment
 	  map {($_) = grep s/^$type://,
 		 $ct->des([qw(-fmt %Xn)], "$type:$_")->qx} @args;
 	  my %targ;		#target vobs per type
-	  my $cvob = $ct->des(['-s'], 'vob:.')->stderr(0)->qx; #Maybe not
-	  for (@args) {
-	    my $mvob = $1 if /\@(.*)$/;
-	    my $lvob = (shift(@a) =~ /\@(.*)$/)? $1: $cvob;
-	    $targ{$_} = $lvob if $lvob and $lvob ne $mvob;
+	  if ($opt{config}) {
+	    my ($tn, $tv) = split /\@/, $args[0];
+	    die Msg('E', qq("$tn" is "administered" from another vob))
+	      if $tv ne $vob[0];
+	    shift @vob; # Retain only the vobs where to copy
+	  } else {
+	    my $cvob = $ct->des(['-s'], 'vob:.')->stderr(0)->qx;
+	    for (@args) {
+	      my $mvob = $1 if /\@(.*)$/;
+	      my $lvob = (shift(@a) =~ /\@(.*)$/)? $1: $cvob;
+	      $targ{$_} = $lvob if $lvob and $lvob ne $mvob;
+	    }
 	  }
 	  $ntype->opts(@cmt, $ntype->opts);
 	  my $lct = ClearCase::Argv->new(); #Not autochomp
@@ -1375,29 +1515,28 @@ sub _GenMkTypeSub {
 	      warn Msg('E', "Not a family type: $t");
 	      next INCT;
 	    }
-	    my ($t1) = $t =~ /^(.*?)(@|$)/;
-	    for my $l ($t1, $prev) {
-	      if ($ct->lslock(['-s'], "lbtype:$l\@$vob")->stderr(0)->qx) {
-		$lck = 1;  #remember to lock the equivalent fixed type
-		#This should happen as vob owner, to retain the timestamp
-		my @out =
-		  $lct->unlock("lbtype:$l\@$vob")->stderr(1)->qx;
-		if (grep /^cleartool: Error/, @out) {
-		  if ($fl and !$loaded) {
-		    my $fn = $fl; $fn =~ s%::%/%g; $fn .= '.pm';
-		    require $fn;
-		    $fl->import;
-		    $loaded = 1;
-		  }
-		  if (!$fl) {
-		    print @out;
-		    next INCT;
-		  } elsif (funlocklt($l, $vob)) {
-		    next INCT;
-		  }
-		} else {
-		  print @out;
-		}
+	    my $lbt = "lbtype:$t";
+	    if ($ct->lslock(['-s'], $lbt)->stderr(0)->qx) {
+	      $lck = 1; #remember to lock the previous equivalent back
+	       #This should happen as vob owner, to retain the timestamp
+	      _wrap('unlock', $lbt); # Will unlock both types
+	    }
+	    if ($opt{config} and @vob) {
+	      $silent->mklbtype([qw(-rep -glo)], $t)->system
+		unless $ct->des([qw(-fmt %[type_scope]p)], $lbt)->qx eq 'global';
+	      my %already;
+	      $already{$_}++ for grep {s%^.*\@(.*)$%$1%}
+		$ct->des([qw(-s -ahl GlobalDefinition)], $lbt)->qx;
+	      my $t1 = (split /\@/, $lbt)[0];
+	      for my $v (@vob) {
+		next if $already{$v};
+		my $cpy =  "$t1\@$v";
+		_wrap('cptype', $lbt, $cpy);
+	      }
+	      if (grep !/^-glo/, $ntype->opts) {
+		my @opts = $ntype->opts;
+		push @opts, '-glo';
+		$ntype->opts(@opts);
 	      }
 	    }
 	    if ($prev =~ /^(.*)_(\d+)(?:\.(\d+))?$/) {
@@ -1421,14 +1560,16 @@ sub _GenMkTypeSub {
 		$silent->cptype($t1, $t2)->system;
 		$silent->mkhlink(['GlobalDefinition'], $t2, $t1)->system;
 	      }
-	      if ($lck) {
-		my @out =
-		  $lct->lock("lbtype:$prev\@$vob")->stderr(1)->qx;
-		if ($fl and grep /^cleartool: Error/, @out) {
-		  flocklt($prev, $vob); # loaded while unlocking
-		} else {
-		  print @out;
+	      if ($opt{config} and @vob) { # Only lbtypes
+		my $lbt = "lbtype:$new";
+		my $lbt1 = "lbtype:$1" if $new =~ /^(.*?\@)/;
+		for my $v (@vob) {
+		  my $cpy =  "$lbt1$v";
+		  _wrap('cptype', $lbt, $cpy);
 		}
+	      }
+	      if ($lck) {
+		_wrap('lock', "lbtype:$prev\@$vob") and die "\n";
 	      }
 	    } else {
 	      warn Msg('W',qq(Previous increment non suitable in $t: "$prev"));
@@ -1486,10 +1627,11 @@ sub mklbtype {
   use strict;
   use warnings;
   my (%opt, $rep);
-  GetOptions(\%opt, qw(family increment archive));
+  GetOptions(\%opt, qw(family increment archive config=s c99=s exclude=s));
   GetOptions('replace' => \$rep);
   die Msg('E', 'Incompatible options: family increment archive')
-    if keys %opt > 1;
+    if (keys %opt > 1 and !$opt{config}) or (keys %opt > 2 and !$opt{exclude})
+      or keys %opt > 3;
   my $ntype = ClearCase::Argv->new(@ARGV);
   $ntype->parse(qw(global|ordinary vpelement|vpbranch|vpversion
 		   pbranch|shared gt|ge|lt|le|enum|default|vtype=s
@@ -1585,7 +1727,6 @@ sub lock {
   my (%opt, $nusers);
   GetOptions(\%opt, qw(allow=s deny=s iflocked));
   GetOptions('nusers=s' => \$nusers);
-  ClearCase::Argv->ipc(1);
   my $lock = ClearCase::Argv->new(@ARGV);
   $lock->parse(qw(c|cfile=s cquery|cqeach nc pname=s obsolete replace));
   die Msg('E', "cannot specify -nusers along with -allow or -deny")
@@ -1624,29 +1765,24 @@ sub lock {
   my @args = $lock->args;
   $ct = ClearCase::Argv->new({autochomp=>1});
   my (@lbt, @oth, %vob);
-  my $locvob = $ct->argv(qw(des -s vob:.))->stderr(0)->qx;
-  foreach my $t (@args) {
-    if ($ct->argv(qw(des -fmt), '%m\n', $t)->stderr(0)->qx eq 'label type') {
-      my ($t1,$v) = $t;
-      if ($t =~ /lbtype:(.*)@(.*)$/) {
-	$t = $1; $v = $2;
-      } else {
-	$t =~ s/^lbtype://;
-	$v = $locvob;
-      }
+  my $locvob = $ct->des(['-s'], 'vob:.')->stderr(0)->qx;
+  foreach my $t ($ct->des([qw(-fmt %Xn\n)], @args)->qx) {
+    if ($ct->des([qw(-fmt %m)], $t)->stderr(0)->qx eq 'label type') {
+      my ($t1, $v) = $t;
+      $v = $2 if $t =~ s/lbtype:(.*)@(.*)$/$1/;
       $vob{$t} = $v;
       push @lbt, $t;
       my @et = grep s/^-> lbtype:(.*)@.*$/$1/,
-	$ct->argv(qw(des -s -ahl), $eqhl, $t1)->qx;
+	$ct->des([qw(-s -ahl), $eqhl], $t1)->qx;
       if (@et) {
 	my ($e, $p) = ($et[0], '');
 	$vob{$e} = $vob{$t};
 	push @lbt, $e;
 	my @pt = grep s/^-> lbtype:(.*)@.*$/$1/,
-	  $ct->argv(qw(des -s -ahl), $prhl, "lbtype:$e\@$v")->qx;
+	  $ct->des([qw(-s -ahl), $prhl], "lbtype:$e\@$v")->qx;
 	if (@pt) {
 	  $p = $pt[0];
-	  if (!$ct->argv(qw(lslock -s), "lbtype:$p\@$v")->stderr(0)->qx) {
+	  if (!$ct->lslock(['-s'], "lbtype:$p\@$v")->stderr(0)->qx) {
 	    push @lbt, $p;
 	    $vob{$p} = $v;
 	  }
@@ -1693,25 +1829,19 @@ environment variable.
 =cut
 
 sub unlock() {
-  ClearCase::Argv->ipc(1);
   my $unlock = ClearCase::Argv->new(@ARGV);
   $unlock->parse(qw(c|cfile=s cquery|cqeach nc version=s pname=s));
   my @args = $unlock->args;
   $ct = ClearCase::Argv->new({autochomp=>1});
   my (@lbt, @oth, %vob);
-  my $locvob = $ct->argv(qw(des -s vob:.))->stderr(0)->qx;
-  foreach my $t (@args) {
-    if ($ct->argv(qw(des -fmt), '%m\n', $t)->stderr(0)->qx eq 'label type') {
+  my $locvob = $ct->des(['-s'], 'vob:.')->stderr(0)->qx;
+  foreach my $t ($ct->des([qw(-fmt %Xn\n)], @args)->qx) {
+    if ($ct->des([qw(-fmt %m)], $t)->stderr(0)->qx eq 'label type') {
       my $t1 = $t;
-      if ($t =~ /lbtype:(.*)@(.*)$/) {
-	$t = $1; $vob{$t} = $2;
-      } else {
-	$t =~ s/^lbtype://;
-	$vob{$t} = $locvob;
-      }
+      $vob{$t} = $2 if $t =~ s/lbtype:(.*?)@(.*)$/$1/;
       push @lbt, $t;
       my @et = grep s/^-> lbtype:(.*)@.*$/$1/,
-	$ct->argv(qw(des -s -ahl), $eqhl, $t1)->qx;
+	$ct->des([qw(-s -ahl), $eqhl], $t1)->qx;
       if (@et) {
 	push @lbt, $et[0];
 	$vob{$et[0]} = $vob{$t};
@@ -1724,7 +1854,7 @@ sub unlock() {
   my ($fl, $loaded) = $ENV{FORCELOCK};
   for my $lt (@lbt) {
     my $v = $vob{$lt};
-    if ($ct->argv(qw(lslock -s), "lbtype:$lt\@$v")->qx) {
+    if ($ct->lslock(['-s'], "lbtype:$lt\@$v")->qx) {
       my @out = $unlock->args("lbtype:$lt\@$v")->stderr(1)->qx;
       if (grep /^cleartool: Error/, @out) {
 	if ($fl and !$loaded) {
@@ -1769,6 +1899,16 @@ application after a first failure.
 It may also be used to apply labels upwards even if recursive application
 produced errors.
 
+B<-config>: adapted for incremental types. This requires that the
+label types have been created previously with I<mklbtype -config>.
+It will not use admin vobs!
+
+The script will skip, and report, vobs in which the types have not
+been copied/linked to.
+
+With incremental types, the I<-replace> flag is implicit in
+conjunction with I<-config>.
+
 Extension: B<-over> takes either a label or a branch type. In either case,
 the labels will be applied over the result of a find command run on the
 unique version argument, and looking for versions matching respectively
@@ -1791,20 +1931,30 @@ would hide the updated baseline.
 sub mklabel {
   use warnings;
   use strict;
+  use File::Basename;
+  use File::Spec::Functions qw(rel2abs);
+  File::Spec->VERSION(0.82);
   my %opt;
-  GetOptions(\%opt, qw(up force over=s all));
+  GetOptions(\%opt, qw(up force over=s all config=s));
   ClearCase::Argv->ipc(1);
   my $mkl = ClearCase::Argv->new(@ARGV);
   $mkl->parse(qw(replace|recurse|follow|ci|cq|nc
-		 version=s c|cfile|select|type|name|config=s));
+		 version=s c|cfile|select|type|name));
   my @opt = $mkl->opts();
   die Msg('E', 'all is only supported in conjunction with over')
     if $opt{all} and !$opt{over};
-  die Msg('E', 'Incompatible flags: up and config')
-    if $opt{up} and grep /^-con/, @opt;
-  die Msg('E', 'Incompatible flags: recurse and over')
-    if $opt{over} and grep /^-r(ec|$)/, @opt;
-  die Msg('E', 'Incompatible flags: up and over') if $opt{up} and $opt{over};
+  {
+    my @inc = ([qw(up config)], [qw(up over)]);
+    for (@inc) {
+      my ($a, $b) = @{$_}[0..1];
+      die Msg('E', "Incompatible flags: $a and $b") if $opt{$a} and $opt{$b};
+    }
+    @inc = qw(config over);
+    for (@inc) {
+      die Msg('E', "Incompatible flags: $_ and recurse")
+	if $opt{$_} and grep /^-r(ec|$)/, @opt;
+    }
+  }
   my($lbtype, @elems) = $mkl->args;
   die Msg('E', 'Only one version argument with the over flag')
     if $opt{over} and scalar @elems > 1;
@@ -1812,7 +1962,7 @@ sub mklabel {
   $lbtype =~ s/^lbtype://;
   $ct = ClearCase::Argv->new({autochomp=>1});
   my (%vb, @lt);
-  for my $e (@elems?@elems:qw(.)) {
+  for my $e (@elems?@elems:($opt{config} or '.')) {
     my $v = $ct->argv(qw(des -s), "vob:$e")->stderr(0)->qx;
     $vb{$v}++ if $v;
   }
@@ -1825,9 +1975,52 @@ sub mklabel {
   my $fail = $ct->clone({autofail=>1});
   my @et = grep s/^-> lbtype:(.*)@.*$/$1/,
     map { $fail->argv(qw(des -s -ahl), $eqhl, "lbtype:$_")->qx } @lt1;
+  if (!@et and $opt{config}) { #restore @ARGV before falling back to cleartool
+    my @tail;
+    while (@ARGV > 1 and my $item = pop @ARGV) {
+      if ($item =~ /^-/) {
+	push @ARGV, $item;
+	last;
+      }
+      push @tail, $item;
+    }
+    push @ARGV, '-config', $opt{config}, reverse @tail;
+  }
   return 0 unless $opt{up} or $opt{over} or @et;
-  $fail->argv(qw(des -s), @elems)->stdout(0)->system
-    unless $opt{over} and !@elems; #eq fixed => 1 failure fails all
+  $fail->argv(qw(des -s), @elems)->stdout(0)->system if @elems; #-over & -con ok
+  my %con = (cr => rel2abs($opt{config})) if $opt{config}; # scope globals
+  if (%con) {
+    push @opt, '-rep' if @et and !grep /^-rep/, @opt;
+    my $cr = $con{cr}; # for convenience
+    die Msg('E', "No arguments expected: '@elems'") if @elems;
+    my @dir = $ct->catcr([qw(-flat -s -type d -nxn)], $cr)->qx;
+    die "\n" if grep /^</, @dir; #one vob not mounted
+    my $mvob = $ct->des(['-s'], "vob:$cr")->qx;
+    my $pfx = $1 if $cr =~ m%^(.*?)$mvob%; #Windows, cygwin, view extended path
+    my (%crvb, %lbvb);
+    $crvb{$ct->des(['-s'], "vob:$_")->stderr(0)->qx}++ for @dir;
+    $lbvb{$_}++ for grep s/^<- .*\@(.*)$/$1/,
+      $ct->des([qw(-s -ahl GlobalDefinition)], "lbtype:$lt[0]")->qx;
+    my $lvob = (keys %vb)[0];
+    if ($lbvb{$lvob}++) { # Only the copies found already
+      die Msg('E',
+	      "Mismatch between the source vob of '$lbtype' and this of '$cr'");
+    }
+    for (keys %lbvb) {
+      push @{$con{rmall}}, $_ unless $crvb{$_};
+    }
+    my @origvb = keys %crvb;
+    for (@origvb) {
+      next if $lbvb{$_};
+      warn Msg('W', "No label type found in '$_': skipping.");
+      delete $crvb{$_};
+    }
+    for ($ct->catcr([qw(-flat -s -ele -type fd)], $cr)->qx) {
+      $con{ver}{$_}++ if $crvb{$ct->des(['-s'], "vob:$pfx$_")->qx};
+    }
+    @elems = keys %{$con{ver}};
+    @{$con{vob}} = keys %crvb;
+  }
   die Msg('E', "Only one vob supported for family types") if @et > 1;
   map {
     die Msg('E', qq(Lock on label type "$_" prevents operation "make label"))
@@ -1868,7 +2061,6 @@ sub mklabel {
     $base = '-a' if $opt{all};
     @mod = $ct->argv('find', $base, '-ver', $query, '-print')->stderr(0)->qx;
     if ($opt{all} and $ver) {
-      use File::Spec::Functions qw(rel2abs);
       $ver = rel2abs($ver);
       @mod = grep /^${ver}(\W|$)/, @mod;
     }
@@ -1887,30 +2079,9 @@ sub mklabel {
   }
   $mkl->opts(grep !/^-r(ec|$)/, @opt); # recurse handled already
   if ($opt{up}) {
-    my $dsc = ClearCase::Argv->new({-autochomp=>1});
-    require File::Basename;
-    require File::Spec;
-    File::Spec->VERSION(0.82);
-    my $vroot;
-    if ($^O eq 'cygwin') {
-      my $d0 = File::Basename::dirname(File::Spec->rel2abs($elems[0]));
-      $d0 =~ m%^(/[^/]+/[^/]+)%;
-      $vroot = $1 || ''; # /cygdrive/a or /view/<tag>... just for the length
-    } elsif ($^O =~ /MSWin/) {
-      $vroot = 'a:';
-    } else {
-      $vroot = $ct->argv(qw(pwv -root))->qx;
-    }
     my %ancestors;
-    for my $pname (@elems) {
-      my $vobtag = $dsc->desc(['-s'], "vob:$pname")->qx;
-      my $stop = length("$vroot$vobtag");
-      for (my $dad = File::Basename::dirname(File::Spec->rel2abs($pname));
-	   length($dad) >= $stop;
-	   $dad = File::Basename::dirname($dad)) {
-	$ancestors{$dad}++;
-      }
-    }
+    my $follow = grep /^-f/, @opt;
+    _Recpath(\%ancestors, $follow, $_) for @elems;
     if (@et) {
       push @elems, sort {$b cmp $a} keys %ancestors;
     } else {
@@ -1927,6 +2098,62 @@ sub mklabel {
       $_ = (grep /^$lbtype$/, split/ /,
 	    $ct->argv(qw(des -fmt), '%Nl', $v)->qx)? '' : $v;
     } @elems;
+  }
+  if (%con) {
+    for (@{$con{rmall}}) {
+      my @ver = $ct->find($_, qw(-a -ver), "lbtype($lbtype)", '-print')->qx;
+      _wrap('rmlabel', $lbtype, @ver) if @ver;
+    }
+    my $chkalias = sub {
+      local $_;
+      my $v = shift;
+      my @al = split /, /, $ct->des([qw(-fmt %[aliases]ACp)], $v)->qx;
+      return 0 if @al == 1; #don't waste more time
+      # describe returns aliases in a different way than find
+      my $e = ($v =~ /^(.*?)\@/)? $1 : $v;
+      my $d = dirname $e;
+      my ($a1, $a2, $rc);
+      push @{/^\Q$d\E/?$a1:$a2}, $_ for @al;
+      if (@{$a1} > 1) {
+	my $dv = $ct->ls([qw(-s -d)], $d)->qx;
+	for (grep s%\Q$dv\E%$d%, @{$a1}) {
+	  next if $v =~ /^\Q$_\E\@/; #original representation
+	  if ($con{ver}{$ct->ls([qw(-s -d)], $_)->qx}) {
+	    $rc = 1;
+	    last;
+	  }
+	}
+      }
+      return 1 if $rc;
+      for (@{$a2}) {
+	my $d1 = $1 if /^(.*?)\@/; #Should always match
+	my $dv = $ct->ls([qw(-s -d)], $d1)->qx;
+	s%\Q$dv\E%$d1%;
+	if ($con{ver}{$ct->ls([qw(-s -d)], $_)->qx}) {
+	  $rc = 1;
+	  last;
+	}
+      }
+      return $rc;
+    };
+    for (@{$con{vob}}) {
+      my @ver = grep { !$con{ver}{$_} and !$chkalias->($_) }
+	$ct->find($_, qw(-a -ver), "lbtype($lbtype)", '-print')->qx;
+      _wrap('rmlabel', $lbtype, @ver) if @ver;
+    }
+    my $cr = $con{cr};
+    $ct->winkin($cr)->system;
+    my $vob = $ct->des('-s', "vob:$cr")->qx;
+    for my $t (qw(ConfigRecordDO ConfigRecordOID)) {
+      $ct->mkattype(qw(-vty string -nc), "$t\@$vob")->system
+	unless $ct->des('-s', "attype:$t\@$vob")->stderr(0)->qx;
+    }
+    my $lb = "lbtype:$et[0]\@$vob";
+    my $val = $ct->des(['-s'], $cr)->qx;
+    $val =~ s%^.*?\Q$vob\E%$vob%;
+    $ct->mkattr([qw(-rep ConfigRecordDO), qq("$val")], $lb)->system;
+    $val = '"' . $ct->des([qw(-fmt %On)], $cr)->qx . '"';
+    $ct->mkattr([qw(-rep ConfigRecordOID), $val], $lb)->system;
   }
   exit $ret unless @mod;
   my $rmattr = ClearCase::Argv->rmattr([("Rm$lbtype")]);
@@ -2461,7 +2688,7 @@ sub setcs {
     return 1;
   }
   my (@cs1, @cs2, $incfam, $noco);
-  open my $fh, '<', $cs or die Msg('E', qq(Unable to access "$cs": $!\n));
+  open my $fh, '<', $cs or die Msg('E', qq(Unable to access "$cs": $!));
   while (<$fh>) {
     if (/^\#\#:IncrementalLabels: *([^\s]+)(\s+-nocheckout)?/) {
       ($incfam, $noco) = ($1, $2?$2:'');
@@ -2473,11 +2700,11 @@ sub setcs {
   close $fh;
   exit $setcs->system unless $incfam;
   my ($lbtype, $vob) = $incfam =~ /^(?:lbtype:)?(.*?)\@(.*)$/;
-  die Msg('E', qq(Failed to parse the vob from "$incfam"\n)) unless $vob;
+  die Msg('E', qq(Failed to parse the vob from "$incfam")) unless $vob;
   my $rmat = 'Rm' . ($lbtype =~ /^(.*)_/ ? $1 : $lbtype);
   my @eqlst = _EqLbTypeList($lbtype);
   my $nr = $1 if $eqlst[0] =~ /^.*_(\d+\.\d+)$/;
-  die Msg('E', qq("$lbtype" is not the top of a label type family\n))
+  die Msg('E', qq($lbtype" is not the top of a label type family))
     unless $nr;
   my $ct = ClearCase::Argv->new({autochomp=>1});
   $tag = $ct->argv(qw(pwv -s))->qx unless $tag = $setcs->flag('tag');
@@ -2491,7 +2718,7 @@ sub setcs {
     for @eqlst;
   close $fh;
   $cs .= $$;
-  open $fh, '>', $cs or die Msg('E', qq(Could not write "$cs": $!\n));
+  open $fh, '>', $cs or die Msg('E', qq(Could not write "$cs": $!));
   print $fh @cs1;
   print $fh "include $vws/$lbtype\n";
   print $fh @cs2;
@@ -2690,22 +2917,22 @@ sub mkview {
       $lbt = $lb;
       $lb = $1;
     }
-    die Msg('E', qq(Label type not found: "$lb"\n))
+    die Msg('E', qq(Label type not found: "$lb"))
       unless $ct->des(['-s'], $lbt)->qx;
     @eqlst = _EqLbTypeList($lb);
     $nr = $1 if $eqlst[0] =~ /^.*_(\d+\.\d+)$/;
-    die Msg('E', qq("$lb" is not the top of a label type family\n)) unless $nr;
+    die Msg('E', qq("$lb" is not the top of a label type family)) unless $nr;
     if ($ts) {
       $rt = str2time($ts);
-      die Msg('E', qq(Failed to parse "$ts" as a timestamp\n)) unless $rt;
-      die Msg('E', qq("$lb" is not a floating label type\n))
+      die Msg('E', qq(Failed to parse "$ts" as a timestamp)) unless $rt;
+      die Msg('E', qq("$lb" is not a floating label type))
 	unless grep /^->/, $ct->des([qw(-s -ahl), $eqhl], $lbt)->qx;
       my $v = $lb =~ /(@.*)$/? $1 : '';
       while (str2time($ct->des(qw(-fmt %d), "lbtype:$eqlst[0]$v")->qx) > $rt) {
 	shift @eqlst;
 	last unless @eqlst;
       }
-      die Msg('E', qq("$ts" too old: no equivalent baseline\n)) unless @eqlst;
+      die Msg('E', qq("$ts" too old: no equivalent baseline)) unless @eqlst;
       $nr = $1 if $eqlst[0] =~ /^.*_(\d+\.\d+)$/;
       my @bits = map{ $_ = 0 unless $_ } strptime($ts);
       $ts = strftime(q(%Y-%m-%dT%H:%M:%S%z), @bits); #Standardize
@@ -2749,7 +2976,7 @@ sub mkview {
     };
     my (@cs1, @cs2, $incfam, $noco);
     push @cs1, "time $ts\n";
-    open my $fh, '<', $cs or die Msg('E', qq(Unable to access "$cs": $!\n));
+    open my $fh, '<', $cs or die Msg('E', qq(Unable to access "$cs": $!));
     while (<$fh>) {
       if (/^element .*\s\Q$l\E(\s+-nocheckout)?/) {
 	$noco = defined($1)? $1 : '';
@@ -2762,7 +2989,7 @@ sub mkview {
     close $fh;
     if ($incfam) {
       open $fh, '>', $f
-	or die Msg('E', qq(Failed to write config spec fragment "$f": $!\n));
+	or die Msg('E', qq(Failed to write config spec fragment "$f": $!));
       print $fh qq(element * "{lbtype($_)&&!attr_sub($rmat,<=,$nr)}$noco"\n)
 	for @eqlst;
       close $fh;
@@ -2827,7 +3054,7 @@ sub rollout {
   Assert(@ARGV == 2);		# die with usage msg if untrue
   shift @ARGV;
   my $arg = $ARGV[0];
-  die Msg('E', "The target baseline type is a mandatory argument\n")
+  die Msg('E', 'The target baseline type is a mandatory argument')
     unless $opt{to};
   my $bl = $opt{to}; $bl =~ s/^lbtype://;
   my $lbl = "lbtype:$bl";
@@ -2839,7 +3066,7 @@ sub rollout {
   my $lvob = $ct->des(['-s'], 'vob:.')->stderr(0)->qx; # Maybe not in a vob
   my $vob = $arg =~ /\@(.*)$/? $1 : $lvob;
   if ($bl =~ /\@(.*)$/) {
-    die Msg('E', "$bl must be in the same vob as $arg\n") unless $1 eq $vob;
+    die Msg('E', "$bl must be in the same vob as $arg") unless $1 eq $vob;
   } else {
     $lbl .= "\@$vob";
   }
@@ -2847,7 +3074,7 @@ sub rollout {
   my $targ = $bt? "brtype:$arg" : "lbtype:$arg";
   my @vobs;
   if ($fail->des([qw(-fmt %[type_scope]p)], $targ)->qx eq 'global') {
-    die Msg('E', 'Global types are not supported in this version\n');
+    die Msg('E', 'Global types are not supported in this version');
     my @hl = grep/^\s+GlobalDefinition/,
       $ct->des([qw(-l -ahl GlobalDefinition)], $targ)->qx;
     if (@hl) {
@@ -2873,7 +3100,7 @@ sub rollout {
 	last;
       }
     }
-    die Msg('E', "Home merge (rebase) needed\n") if $hmrg;
+    die Msg('E', 'Home merge (rebase) needed') if $hmrg;
   }
   if ($sil->des(['-s'], $lbl)->system) {
     my @opt = @cmt;
@@ -2888,7 +3115,7 @@ sub rollout {
     if ($ct->des([qw(-s -ahl), $eqhl], $lbl)->qx) {
       _wrap(qw(mklbtype -inc), @cmt, $lbl) and die "\n";
     } else {
-      die Msg('E', "The baseline type must be a family type\n");
+      die Msg('E', 'The baseline type must be a family type');
     }
   }
   my $la = $arg; $la =~ s/\@.*$//; # Local name: vob in $lbl
@@ -2945,7 +3172,7 @@ sub rollback {
   my %opt;
   GetOptions(\%opt, qw(force to=s comment=s));
   Assert(@ARGV == 1);		# die with usage msg if untrue
-  die Msg('E', "to argument mandatory\n") unless $opt{to};
+  die Msg('E', q("to" argument mandatory)) unless $opt{to};
   shift @ARGV;
   my @cmt = ('-c', ($opt{comment} or "rollback to $opt{to}"));
   $ct = ClearCase::Argv->new({autochomp=>1});
@@ -2961,7 +3188,7 @@ sub rollback {
     $t = $t1;
   }
   my ($flt) = grep s/^<- (.*)$/$1/, $ct->des([qw(-s -ahl), $eqhl], $t)->qx;
-  die Msg('E', "Only rolling back to increments (label types)\n") unless $flt;
+  die Msg('E', 'Only rolling back to increments (label types)') unless $flt;
   my $tag = ViewTag();
   die Msg('E', "view tag cannot be determined") unless $tag;;
   my($vws) = reverse split '\s+', $ct->lsview($tag)->qx;
@@ -2972,7 +3199,7 @@ sub rollback {
   die Msg('E', "Unexpected value: $flt") unless $flt1;
   *::usedflt = sub {chomp; s/\#.*//; $used |= /element .*?\s\Q$flt1\E(\s|$)/};
   Burrow('CATCS_00', "$vws/config_spec", '::usedflt');
-  die Msg('E', "the current view doesn't use $flt1\n") unless $used;
+  die Msg('E', "the current view doesn't use $flt1") unless $used;
   my $tmptag = $tag . '_00';
   {
     my $nr = 0;
@@ -3012,7 +3239,7 @@ sub rollback {
 		 or ($lvob and $lvob ne $vob));
   if (MSWIN or CYGWIN) {
     my $winpfx = $1 if $cwd =~ m%^(.*?)\Q$lvob\E.*%;
-    die Msg('E', "Failed to extract the view prefix for $lvob from $cwd\n")
+    die Msg('E', "Failed to extract the view prefix for $lvob from $cwd")
       unless $winpfx;
     $ct->cd("${winpfx}$vob")->system;
   } else {
@@ -3022,7 +3249,7 @@ sub rollback {
     and die "\n";
   if (_wrap('mklbtype', @cmt, '-inc', $flt)) {
     $rmv->();
-    die Msg('E', "Failed to increment $flt1: aborting\n");
+    die Msg('E', "Failed to increment $flt1: aborting");
   }
   if (MSWIN or CYGWIN) {
     my @use = grep /^(?:\w+)?\s+[A-Z]:/, qx(net use);
@@ -3042,7 +3269,7 @@ sub rollback {
     }
     if (!$drv) {
       $rmv->();
-      die Msg('E', "Need a free drive letter to map the $tmptag temp view\n");
+      die Msg('E', 'Need a free drive letter to map the $tmptag temp view');
     }
     open(SAVEOUT, ">&STDOUT");
     open(STDOUT, $nul);
@@ -3073,6 +3300,61 @@ sub rollback {
   }
   $rmv->();
   exit 0; #FIXME: return code
+}
+
+=back
+
+=item * ARCHIVE
+
+New command. Synonymous to alternatively mkbrtype or mklbtype -arc
+
+This command assigns the comment in a more intuitive way than its
+alternative with mkbrtype: the comment goes to the type being
+archived, instead of to the new type being created.
+
+The non-intuitive behaviour is justified by the consistency with the
+behaviour of mklbtype -arc, for which no user visible type is created.
+
+Another advantage of this syntax over the alternative is the
+possibility to archive in a single command both a lbtype and a brtype
+associated, as happens with the rollout command.
+
+Label types and branch types are grouped and processed in this order.
+
+=cut
+
+sub archive {
+  use strict;
+  use warnings;
+  my %opt;
+  GetOptions(\%opt, qw(nc c|cfile=s));
+  if (keys %opt > 1) {
+    warn Msg('E', 'Only one comment option supported');
+  } elsif (@ARGV > 1) {
+    shift @ARGV;
+    my @lbt = grep /^lbtype:/, @ARGV;
+    my @brt = grep /^brtype:/, @ARGV;
+    if (@lbt + @brt != @ARGV) {
+      my @unk = grep !/(br|lb)type:/, @ARGV;
+      warn Msg('E', "'lbtype: or 'brtype:' prefix required for '@unk'");
+    } else {
+      my @opt = qw(-arc);
+      if ($opt{nc}) {
+	unshift @opt, '-nc';
+      } elsif (%opt) {
+	my ($k, $v) = each %opt;
+	unshift @opt, "-$k", $v;
+      }
+      my $rc = _wrap('mklbtype', @opt, @lbt) if @lbt;
+      $rc   += _wrap('mkbrtype', @opt, @brt) if @brt;
+      exit $rc;
+    }
+  } else {
+    warn Msg('E', 'Type name required.');
+  }
+  @ARGV = qw(help archive);
+  ClearCase::Wrapper->help();
+  return 1;
 }
 
 =back
