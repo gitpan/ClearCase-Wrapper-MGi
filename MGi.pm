@@ -1,6 +1,6 @@
 package ClearCase::Wrapper::MGi;
 
-$VERSION = '0.30';
+$VERSION = '0.31';
 
 use warnings;
 use strict;
@@ -61,7 +61,7 @@ use AutoLoader 'AUTOLOAD';
   $mkview = "\n* [-clone view-tag [-equiv lbtype,timestamp]]";
   $describe = "\n* [-par/ents <n>] [-fam/ily <n>]";
   $rollout = "$z [-force] [-c comment] -to baseline brype|lbtype";
-  $rollback = "$z [-force] [-c comment] changeset";
+  $rollback = "$z [-force] [-c comment] -to increment";
   $archive = "$z [-c comment|-nc] brtype|lbtype ...";
 }
 
@@ -296,6 +296,7 @@ sub _DepthGen {
   return %gen;
 }
 sub _Mkbco {
+  use File::Copy;
   my ($cmd, @cmt) = @_;
   my $rc = 0;
   my %pbrt = ();
@@ -352,14 +353,24 @@ sub _Mkbco {
 	qr([\\/]${main}[\\/]$bt[\\/]\d+$) : qr([\\/]$bt[\\/]\d+$);
       if ($ver =~ m%$re%) {
 	push @opts, @cmt, $e;
-	$rc |= $ct->argv('co', @opts)->system;
+	$rc |= $ct->co(@opts)->system;
       } else {
 	my @mkbcopt = @cmt? @cmt : qw(-nc);
+	my $out = $cmd->flag('out');
+	my $nda = $cmd->flag('ndata');
+	copy($e, $out) or die Msg('E', "Failed to create $out: $!") if $out;
+	push @mkbcopt, '-nco' if $out or $nda;
 	if ($ct->mkbranch([@mkbcopt, '-ver', "/$main/0", $bt], $e)->system) {
 	  $rc = 1;
 	} else {
+	  if ($out or $nda) {
+	    my $e0 = "$e\@\@/$main/$bt/0";
+	    $rc = $ct->co(['-nda', @cmt? @cmt : '-nc'], $e0)->system;
+	  }
 	  if ($ver !~ m%\@\@[\\/]${main}[\\/]0$%) {
-	    my $lrc = $ct->merge(['-to', $e], $ver)->stdout(0)->system;
+	    my @o = ('-to', $e);
+	    push @o, '-nda' if $out or $nda;
+	    my $lrc = $ct->merge([@o], $ver)->stdout(0)->system;
 	    unlink glob("$e.contrib*");
 	    $rc |= $lrc;
 	  }
@@ -370,8 +381,7 @@ sub _Mkbco {
       push @args, @opts, @cmt;
       push @args, $bt if $bt;
       push @args, $e; # Ensure non empty array
-      $rc |= $bt? $ct->argv('mkbranch', @args)->system
-	: $ct->argv('co', @args)->system;
+      $rc |= $bt? $ct->mkbranch(@args)->system : $ct->co(@args)->system;
     }
   }
   return $rc;
@@ -2031,11 +2041,11 @@ sub mklabel {
   use File::Spec::Functions qw(rel2abs);
   File::Spec->VERSION(0.82);
   my %opt;
-  GetOptions(\%opt, qw(up force over=s all config=s));
+  GetOptions(\%opt, qw(up force over=s all config=s c99=s));
   ClearCase::Argv->ipc(1);
   my $mkl = ClearCase::Argv->new(@ARGV);
   $mkl->parse(qw(replace|recurse|follow|ci|cq|nc
-		 version=s c|cfile|select|type|name));
+		 version=s c|cfile|select|type|name=s));
   my @opt = $mkl->opts();
   die Msg('E', 'all is only supported in conjunction with over')
     if $opt{all} and !$opt{over};
