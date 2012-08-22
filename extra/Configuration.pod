@@ -25,18 +25,20 @@ the wrapper for specific needs, either on a site on a user basis.
 
 The features described here are not enabled by default.
 
-One functionality is highly experimental: fixing the layout of source
+One functionality is highly experimental
+(the C<FSCBROKER> environment variable): fixing the layout of source
 containers for elements of text_file and derivate types, in
-conjunction with the I<BranchOff> mechanism.
+conjunction with the I<BranchOff> mechanism
 
 =head2 BranchOff
 
 The I<BranchOff> mechanism is one of the two driving forces of this
-wrapper (the other one being I<incremental type families>.
+wrapper (the other one being I<incremental type families>).
 
-The intention is to make it possible to always branch off a version
-not on a branch one created oneself, and this without ending up
-cascading 'forever', i.e. until meeting system limits.
+The intention is to make it possible to always branch off,
+when checking out a version not already on a branch one created oneself;
+this without ending up cascading 'forever',
+i.e. until meeting system limits.
 
 The setup is simple, and per view. Start your config spec with a
 meta-comment such as:
@@ -49,6 +51,10 @@ every element (usually C</main/0>).
 
 The relation to the predecessor version is not lost: it is
 reestablished with a C<Merge> hyperlink.
+
+As this might result in 'bloated' source containers
+(in fact a very minor concern, even with certain advantages),
+an additional, optional setup may be considered: see below.
 
 =head3 fixsrccnt, FixSrcCont.pm, FSCbrokerSuDo, FSCbrokerSsh
 
@@ -113,7 +119,7 @@ accordingly:
 
 =head2 VobPathConv.pm
 
-I<VobPathConv.pm> (and its pod file) does however not require any
+I<VobPathConv.pm> (and its pod file) does not require any
 configuration and may be used as such. I may even consider to extract
 it and publish it as a separate package in its own, albeit modest,
 right.
@@ -133,9 +139,12 @@ The lack of such an ability is considered a bug in ClearCase, and is the
 object of an RFE (currently rejected...). It defeats the use of locking in
 general.
 
-The installer must select the solution best adapted to her case,
+The installer must select the solution(s) best adapted to her case,
 possibly edit a few fields appropriate to her environment, and copy
-the suitable file by hand to the parl lib/site_perl directory.
+the suitable file by hand to the lib/site_perl directory.
+
+Users must pick up these configurations with environment variables,
+e.g. setting them in their C<~/.clearcase_profile.pl> file
 
 I<ForceLockSudo.pm> implements the simplest, safest and most efficient
 solution, from unix. As its alternatives, dealing with cases in which
@@ -145,31 +154,41 @@ environment variable
 
   FORCELOCK=ClearCase::ForceLockSudo
 
-This is so its use would not penalize functions which do not require locking.
-Two other versions are provided for now, one for unix, and one for Windows
-(and cygwin):
+This is so its use would not penalize functions which do not require
+locking.  Two other versions are provided for now, one for unix, and
+one for Windows (and cygwin):
 
   FORCELOCK=ClearCase::ForceLockUnix #Unix
   FORCELOCK=ClearCase::ForceLock     #Windows
 
-These can be used as examples or a templates. They require some customization.
-The two latter build upon I<locklbtype>, a standalone script, to be installed
-suid enabled, owned by an account, which is itself authorized in the ssh
-configurations of the respective vob owners of all vobs in the local region,
-to run locking commands. It acts as a switch, allowing to simplify the
-maintainance of the I<~/.ssh/authorized_keys> files.
+These can be used as examples or a templates. They require some
+customization.  The two latter build upon I<locklbtype>, a standalone
+script, to be installed suid enabled, owned by an account, which is
+itself authorized in the configurations of the respective vob owners
+of all vobs in the local region, to run locking commands. It acts as a
+switch, allowing to simplify the maintainance of the authorization
+setup.
 
-The customization it requires is mostly the name of the host running an sshd
-daemon which it will use. One needs to avoid using I<localhost> here, so that
-different host keys do not overwrite each other in the I<~/.ssh/known_hosts>
-files.
+Two variants are proposed: one using ssh, the other using sudo. Only
+the most suitable one needs to be installed, as I<locklbtype>.  The
+appropriate setup will have to be performed respectively in the vob
+owner accounts' I<~/.ssh/authorized_keys> files, or in the host based
+or system-wide I</etc/sudoers> file.
 
-One may also set the name of the log used to save the identity of the
-unlocking users (for lock events, this is saved in a comment of the locks).
-The paths to ssh and cleartool are likely to be satisfying.
+Both variants require a minimal customization.
 
-In order to use this script, you need to define a pair of functions, for
-locking and unlocking.
+For ssh, one needs to set the name of the host running an sshd daemon
+Note that one needs to avoid using I<localhost> here, so that
+different host keys do not overwrite each other in the
+I<~/.ssh/known_hosts> files.
+
+For both, one may also set the name of the log used to save the
+identity of the unlocking users (for lock events, this is saved in a
+comment of the locks).  The paths to ssh or sudo, cleartool and perl
+are likely to be satisfying.
+
+In order to use this script, we needed to define a pair of functions,
+for locking and unlocking.
 
 The unix version of the I<ClearCase::ForceLock> module, is meant to
 invoke locklbtype via a system call, therefore using the suid bit
@@ -225,6 +244,10 @@ I cannot claim that this list is a minimal requirement.
 
 =head2 .clearcase_profile.pl
 
+This file is meant to be found in the user home directory.
+It is common to all possible wrappers derived from ClearCase::Wrapper.
+It may be symlinked from a shared version, for sitewise configuration.
+
 An example of I<.clearcase_profile.pl> sets the ipc mode for all
 commands apart for setview (unavailable then, assuming the wrapper
 itself is used from a vob).
@@ -238,12 +261,24 @@ types (including the metadata types) in vobs having an admin vob.
 
 This used to be the default with I<ClearCase::Wrapper::DSB>.
 
+Next possible setting:
+
+  $ClearCase::Wrapper::MGi::lockbl = 1;
+
+If this is set, the baseline type is locked in the end of a rollout.
+Conversely, a next rollout is aborted if the baselin is found unlocked on
+entry, in order to prevent possible collisions of independent rollouts.
+This would be the default if locking/unlocking by group members was
+supported natively by ClearCase, instead of depending on user configuration.
+
 Note that one might e.g. add there code such as:
 
   umask(002);
 
 This ensures that under cleartool (from the wrapper), group members
 are granted write access e.g. to directory elements being created.
+
+The example provided also sets an environment variable (see below).
 
 =head2 environment variables
 
@@ -253,6 +288,8 @@ Four variables to consider (see earlier for the two first):
   FSCBROKER
   CLEARCASE_TAB_SIZE: affects the annotate format (default: 2)
   CCMGI_ANNF: annotate format
+  CCMGI_ANNL: length of the prefix in the annotate format
+    (before the actual file contents)
 
 The default annotate format is:
 
@@ -261,3 +298,10 @@ The default annotate format is:
 This means: a short date, a 25 chars right aligned, possibly truncated
 field for the version specification, a 9 chars left aligned field for
 the author. The same format is used for elisions as for additions.
+
+Its corresponding prefix length is: 49 (10 for the date, 25 for the
+version, 9 for the id, 2 for space separators, and 3 for the deletion
+marker--including spaces).
+
+This prefix is used to compute the beginning of the text upon which to
+apply regexps in case of using the C<-grep> option of C<annotate>.
